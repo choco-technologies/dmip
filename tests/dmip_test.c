@@ -104,8 +104,8 @@ static void collect_fragment(const uint8_t* fragment, size_t fragment_len, void*
     collector->count++;
 }
 
-#define TEST_DEVICE_PATH_0 "/null"
-#define TEST_DEVICE_PATH_1 "/null2"
+#define TEST_DEVICE_PATH_0 "/dev/null"
+#define TEST_DEVICE_PATH_1 "/dev/null"
 
 static dmnetif_iface_t g_iface0 = NULL;
 static dmnetif_iface_t g_iface1 = NULL;
