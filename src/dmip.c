@@ -1037,6 +1037,7 @@ dmod_dmip_api_declaration(1.0, int, _v4_send, ( const dmip_v4_header_t* header, 
     if (full_header.src.family == dmip_family_none)
     {
         dmnetbridge_get_source_address(&header->dst, &full_header.src); /* best-effort, same as dmnetbridge_send()'s own resolution */
+        full_header.src.family = dmip_family_v4; /* 0.0.0.0 (unspecified) is a legitimate v4 source when resolution fails or the egress iface has no IP configured - dmip_v4_fragment() rejects anything else as -EINVAL, which would otherwise mask the real failure that dmnetbridge_send() below is about to report */
     }
 
     uint16_t mtu = DMNETIF_DEFAULT_MTU;
