@@ -820,6 +820,38 @@ DMOD_TEST_STEP(v4_send_full_path_without_real_driver_returns_eio)
     dmroute_remove(route);
 }
 
+DMOD_TEST_STEP(v4_send_on_iface_no_route_does_not_return_enetunreach)
+{
+    /* g_iface0 has no route and no IP address configured anywhere in this
+     * file - dmip_v4_send() would fail this with -ENETUNREACH before ever
+     * reaching dmnetbridge_send(). dmip_v4_send_on_iface() skips routing
+     * entirely (dst is treated as on-link on g_iface0 directly), so it must
+     * get past that point - the limited broadcast address needs no ARP
+     * resolution either (see dmarp.c's is_broadcast_target()), so this runs
+     * all the way to the final dmnetif_send(), which fails (-EIO) since
+     * "/null" never backs a real driver - same tradeoff
+     * v4_send_full_path_without_real_driver_returns_eio above documents for
+     * dmip_v4_send(). */
+    dmip_v4_header_t header = { 0 };
+    header.dst = make_v4(255, 255, 255, 255);
+    header.src = make_v4(0, 0, 0, 0); /* explicitly set, family v4 - as DHCP always does */
+    header.protocol = DMIP_PROTO_UDP;
+    header.ttl = DMIP_DEFAULT_TTL;
+    header.identification = dmip_v4_next_identification();
+
+    int result = dmip_v4_send_on_iface(g_iface0, &header, NULL, 0, DMARP_DEFAULT_TIMEOUT_MS);
+    DMOD_TEST_EXPECT_NE(result, -ENETUNREACH);
+    DMOD_TEST_EXPECT_EQ(result, -EIO);
+}
+
+DMOD_TEST_STEP(v4_send_on_iface_rejects_null_iface)
+{
+    dmip_v4_header_t header = { 0 };
+    header.dst = make_v4(255, 255, 255, 255);
+
+    DMOD_TEST_EXPECT_EQ(dmip_v4_send_on_iface(NULL, &header, NULL, 0, DMARP_DEFAULT_TIMEOUT_MS), -EINVAL);
+}
+
 /* ---- Receive plumbing shared by protocol-dispatch tests below ----
  *
  * Receiving is push-based (see dmip.c's "Protocol dispatch" section) -

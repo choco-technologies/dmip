@@ -990,27 +990,28 @@ dmod_dmip_api_declaration(1.0, int, _v4_get_source_address, ( const dmip_addr_t*
 }
 
 /**
- * @brief dmip_v4_fragment_func_t state for dmip_v4_send() - transmits
- *        each emitted IP fragment via dmnetbridge_send()
+ * @brief dmip_v4_fragment_func_t state for v4_send_common() - transmits
+ *        each emitted IP fragment via dmnetbridge_send()/_send_on_iface()
  */
 typedef struct
 {
     const dmip_addr_t* dst;
+    dmnetif_iface_t     iface;         /**< NULL: route via dmnetbridge_send() */
     uint32_t            arp_timeout_ms;
-    int                 result;    /**< First failure seen so far, or 0 */
+    int                 result;        /**< First failure seen so far, or 0 */
 } send_v4_ctx_t;
 
 /**
- * @brief dmip_v4_fragment_func_t implementation backing dmip_v4_send()
+ * @brief dmip_v4_fragment_func_t implementation backing v4_send_common()
  *
  * Once ctx->result records a failure, later calls are skipped rather than
  * attempting to send after something has already gone wrong - there is no
  * way to signal dmip_v4_fragment() to stop early (its callback returns
  * void), so this just makes every call after the first failure a no-op.
  *
- * Calls dmnetbridge_send() once per fragment rather than resolving the
- * route/MAC once up front and reusing it for every fragment - a multi-
- * fragment packet re-does that lookup once per fragment (cheap: an
+ * Calls dmnetbridge_send()/_send_on_iface() once per fragment rather than
+ * resolving the route/MAC once up front and reusing it for every fragment -
+ * a multi-fragment packet re-does that lookup once per fragment (cheap: an
  * already-cached dmroute/dmarp lookup, not a fresh ARP round trip, unless
  * the very first fragment's own resolution is still in flight). Accepted
  * in exchange for dmip having zero knowledge of routing/interfaces/ARP -
@@ -1022,13 +1023,23 @@ static void send_v4_fragment(const uint8_t* fragment, size_t fragment_len, void*
     if (ctx->result != 0)
         return;
 
-    ctx->result = dmnetbridge_send(ctx->dst, DMIP_ETHERTYPE_IPV4, fragment, fragment_len, ctx->arp_timeout_ms, NULL);
+    ctx->result = (ctx->iface != NULL)
+        ? dmnetbridge_send_on_iface(ctx->iface, ctx->dst, DMIP_ETHERTYPE_IPV4, fragment, fragment_len, ctx->arp_timeout_ms)
+        : dmnetbridge_send(ctx->dst, DMIP_ETHERTYPE_IPV4, fragment, fragment_len, ctx->arp_timeout_ms, NULL);
 }
 
 /**
- * @brief Implementation of dmip_v4_send() - see dmip.h
+ * @brief Shared implementation behind dmip_v4_send()/_v4_send_on_iface()
+ *
+ * `iface == NULL` is dmip_v4_send()'s routed behavior (source address/MTU
+ * via dmnetbridge_get_source_address()/_get_mtu(), transmit via
+ * dmnetbridge_send()). `iface != NULL` is dmip_v4_send_on_iface()'s
+ * bypass: source address/MTU read directly off `iface`
+ * (dmnetif_get_ip_address()/_get_mtu()), transmit via
+ * dmnetbridge_send_on_iface() - no dmroute lookup happens at all, so there
+ * being no route to `header->dst` is not a failure.
  */
-dmod_dmip_api_declaration(1.0, int, _v4_send, ( const dmip_v4_header_t* header, const void* payload, size_t payload_len, uint32_t arp_timeout_ms ))
+static int v4_send_common(dmnetif_iface_t iface, const dmip_v4_header_t* header, const void* payload, size_t payload_len, uint32_t arp_timeout_ms)
 {
     if (header == NULL || (payload == NULL && payload_len > 0) || header->dst.family != dmip_family_v4)
         return -EINVAL;
@@ -1036,20 +1047,46 @@ dmod_dmip_api_declaration(1.0, int, _v4_send, ( const dmip_v4_header_t* header, 
     dmip_v4_header_t full_header = *header;
     if (full_header.src.family == dmip_family_none)
     {
-        dmnetbridge_get_source_address(&header->dst, &full_header.src); /* best-effort, same as dmnetbridge_send()'s own resolution */
-        full_header.src.family = dmip_family_v4; /* 0.0.0.0 (unspecified) is a legitimate v4 source when resolution fails or the egress iface has no IP configured - dmip_v4_fragment() rejects anything else as -EINVAL, which would otherwise mask the real failure that dmnetbridge_send() below is about to report */
+        /* best-effort, same as dmnetbridge_send()/_send_on_iface()'s own resolution */
+        if (iface != NULL)
+            dmnetif_get_ip_address(iface, &full_header.src);
+        else
+            dmnetbridge_get_source_address(&header->dst, &full_header.src);
+        full_header.src.family = dmip_family_v4; /* 0.0.0.0 (unspecified) is a legitimate v4 source when resolution fails or the egress iface has no IP configured - dmip_v4_fragment() rejects anything else as -EINVAL, which would otherwise mask the real failure that dmnetbridge_send()/_send_on_iface() below is about to report */
     }
 
     uint16_t mtu = DMNETIF_DEFAULT_MTU;
-    dmnetbridge_get_mtu(&header->dst, &mtu); /* best-effort - mtu keeps the default above on failure */
+    if (iface != NULL)
+        dmnetif_get_mtu(iface, &mtu); /* best-effort - mtu keeps the default above on failure */
+    else
+        dmnetbridge_get_mtu(&header->dst, &mtu);
 
-    send_v4_ctx_t ctx = { .dst = &header->dst, .arp_timeout_ms = arp_timeout_ms, .result = 0 };
+    send_v4_ctx_t ctx = { .dst = &header->dst, .iface = iface, .arp_timeout_ms = arp_timeout_ms, .result = 0 };
 
     int result = dmip_v4_fragment(&full_header, payload, payload_len, mtu, send_v4_fragment, &ctx);
     if (result != 0)
         return result;
 
     return ctx.result;
+}
+
+/**
+ * @brief Implementation of dmip_v4_send() - see dmip.h
+ */
+dmod_dmip_api_declaration(1.0, int, _v4_send, ( const dmip_v4_header_t* header, const void* payload, size_t payload_len, uint32_t arp_timeout_ms ))
+{
+    return v4_send_common(NULL, header, payload, payload_len, arp_timeout_ms);
+}
+
+/**
+ * @brief Implementation of dmip_v4_send_on_iface() - see dmip.h
+ */
+dmod_dmip_api_declaration(1.0, int, _v4_send_on_iface, ( dmnetif_iface_t iface, const dmip_v4_header_t* header, const void* payload, size_t payload_len, uint32_t arp_timeout_ms ))
+{
+    if (iface == NULL)
+        return -EINVAL;
+
+    return v4_send_common(iface, header, payload, payload_len, arp_timeout_ms);
 }
 
 /**

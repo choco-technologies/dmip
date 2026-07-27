@@ -481,6 +481,41 @@ dmod_dmip_api(1.0, int, _v4_get_source_address, ( const dmip_addr_t* dst, dmip_a
  */
 dmod_dmip_api(1.0, int, _v4_send, ( const dmip_v4_header_t* header, const void* payload, size_t payload_len, uint32_t arp_timeout_ms ));
 
+/**
+ * @brief Build and transmit an IPv4 packet on an explicit interface,
+ *        bypassing routing
+ *
+ * Same packet construction as dmip_v4_send(), but skips dmroute entirely:
+ * `header->dst` is treated as on-link on `iface` (calls
+ * dmnetbridge_send_on_iface() instead of dmnetbridge_send()) and, if
+ * `header->src` is left unset, the source address/MTU come directly from
+ * `iface` (dmnetif_get_ip_address()/dmnetif_get_mtu()) rather than a route
+ * lookup. Use this for traffic that must go out a specific interface before
+ * a route to the destination exists - e.g. a DHCP client's initial
+ * broadcast, sent with `header->src` already set to 0.0.0.0 (family
+ * dmip_family_v4) as DHCP always does, in which case no source-address
+ * lookup is performed at all.
+ *
+ * @param iface         Interface to transmit on - must not be NULL
+ * @param header        Template header - same fields/meaning as
+ *                        dmip_v4_send()'s `header`. `dst` must have family
+ *                        dmip_family_v4
+ * @param payload       Data to send
+ * @param payload_len   Length of `payload` in bytes
+ * @param arp_timeout_ms Forwarded to dmnetbridge_send_on_iface() (and from
+ *                        there to dmarp_resolve()) for a cache miss - use
+ *                        DMARP_DEFAULT_TIMEOUT_MS if you don't have a
+ *                        strong opinion
+ *
+ * @return 0 on success, -EINVAL (bad argument/family, including `iface`
+ *         being NULL), -ENODEV (`iface` is no longer registered),
+ *         -EHOSTUNREACH (ARP resolution failed or timed out), -EMSGSIZE/
+ *         -ENOMEM (see dmip_v4_fragment()), -EIO (a fragment's
+ *         dmnetbridge_send_on_iface() failed - fragments already sent
+ *         before the failure remain on the wire, same as dmip_v4_send())
+ */
+dmod_dmip_api(1.0, int, _v4_send_on_iface, ( dmnetif_iface_t iface, const dmip_v4_header_t* header, const void* payload, size_t payload_len, uint32_t arp_timeout_ms ));
+
 /* ============================================================================
  *                      IPv6
  * ========================================================================== */
