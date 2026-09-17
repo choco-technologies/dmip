@@ -168,6 +168,41 @@ dmod_dmip_api(1.0, int, _register_default_protocol, ( dmip_protocol_handler_t ha
  */
 dmod_dmip_api(1.0, void, _unregister_default_protocol, ( void ));
 
+/**
+ * @brief Callback invoked once per registered protocol by
+ *        dmip_for_each_protocol()
+ *
+ * @param protocol  A protocol/next-header number currently claimed via
+ *                   dmip_register_protocol()
+ * @param user_data Passed through from dmip_for_each_protocol() unchanged
+ */
+typedef void (*dmip_protocol_visitor_t)( uint8_t protocol, void* user_data );
+
+/**
+ * @brief Call `callback` once per protocol number currently claimed via
+ *        dmip_register_protocol()
+ *
+ * Does not include the registered default handler (dmip_register_default_
+ * protocol()), which has no protocol number of its own - see
+ * dmip_register_default_protocol()'s own doc comment. The order entries are
+ * visited in is unspecified (registration order in the current
+ * implementation, but not a guaranteed contract). Safe to call with none
+ * registered (`callback` is simply never invoked).
+ *
+ * `callback` is invoked while the protocol dispatch table's mutex is held -
+ * unlike dispatch_packet()'s handler invocation in src/dmip.c, which copies
+ * the matched handler out first specifically so it can call back into
+ * dmip_register_protocol()/_unregister_protocol() from its own dmod_init()/
+ * _deinit(). A dmip_for_each_protocol() `callback` must not do that (or
+ * call dmip_for_each_protocol() itself) - either would deadlock on the same
+ * (non-recursive) mutex.
+ *
+ * @param callback  Invoked once per registered protocol number. Nothing
+ *                   happens if NULL
+ * @param user_data Passed through to `callback` unchanged
+ */
+dmod_dmip_api(1.0, void, _for_each_protocol, ( dmip_protocol_visitor_t callback, void* user_data ));
+
 /* ============================================================================
  *                      Common constants
  * ========================================================================== */

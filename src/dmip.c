@@ -1231,6 +1231,39 @@ dmod_dmip_api_declaration(1.0, void, _unregister_default_protocol, ( void ))
 }
 
 /**
+ * @brief dmlist_visit_func_t adapting a struct dmip_protocol_entry to the
+ *        dmip_protocol_visitor_t callback dmip_for_each_protocol() got
+ */
+typedef struct
+{
+    dmip_protocol_visitor_t callback;
+    void*                    user_data;
+} for_each_protocol_ctx_t;
+
+static bool for_each_protocol_visit(void* data, void* user_data)
+{
+    struct dmip_protocol_entry* entry = (struct dmip_protocol_entry*)data;
+    for_each_protocol_ctx_t* ctx = (for_each_protocol_ctx_t*)user_data;
+    ctx->callback(entry->protocol, ctx->user_data);
+    return true;
+}
+
+/**
+ * @brief Implementation of dmip_for_each_protocol() - see dmip.h
+ */
+dmod_dmip_api_declaration(1.0, void, _for_each_protocol, ( dmip_protocol_visitor_t callback, void* user_data ))
+{
+    if (callback == NULL)
+        return;
+
+    for_each_protocol_ctx_t ctx = { .callback = callback, .user_data = user_data };
+
+    dmosi_mutex_lock(g_protocol_mutex);
+    dmlist_foreach(g_protocol_handlers, for_each_protocol_visit, &ctx);
+    dmosi_mutex_unlock(g_protocol_mutex);
+}
+
+/**
  * @brief Look up the registered (or default) handler for `protocol`,
  *        call it with `packet` if one exists, then free `packet`
  *

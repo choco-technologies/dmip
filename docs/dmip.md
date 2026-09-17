@@ -173,6 +173,14 @@ for the duration of the call (same contract `dmnetbridge.h`'s
 default handler, or neither) returns, so a handler that wants to keep
 data past the call must copy it out itself.
 
+`dmip_for_each_protocol(callback, user_data)` enumerates the same dispatch
+table for introspection - one call to `callback` per registered protocol
+number, made while the dispatch table's mutex is held (unlike
+`dispatch_packet()`, a `callback` here must not call back into
+`dmip_register_protocol()`/`_unregister_protocol()`/`dmip_for_each_protocol()`
+itself, or it will deadlock). `tools/lsproto` is a small DMOD application
+module built on top of it - see its own README for how to run it.
+
 ## Byte buffers, not packed structs
 
 Like `lib/dmarp/src/dmarp.c` and `tools/ip/src/ip.c`, headers are

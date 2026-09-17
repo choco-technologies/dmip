@@ -91,3 +91,4 @@ dmod_link_modules(${DMOD_MODULE_NAME}
 )
 
 add_subdirectory(tests)
+add_subdirectory(tools/lsproto)

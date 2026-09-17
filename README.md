@@ -307,11 +307,22 @@ No `dmip_v6_send()` yet - see [docs/dmip.md](docs/dmip.md#send--receive).
 | `dmip_unregister_protocol(protocol)` | Undo the above (no-op if unregistered) |
 | `dmip_register_default_protocol(handler)` | Register a fallback for any protocol with no specific registrant |
 | `dmip_unregister_default_protocol(void)` | Undo the above (no-op if unregistered) |
+| `dmip_for_each_protocol(callback, user_data)` | Call `callback` once per protocol number currently claimed via `dmip_register_protocol()` |
 
 ### Well-known protocol numbers
 
 `DMIP_PROTO_ICMP` (1), `DMIP_PROTO_TCP` (6), `DMIP_PROTO_UDP` (17),
 `DMIP_PROTO_IPV6_FRAGMENT` (44), `DMIP_PROTO_ICMPV6` (58).
+
+## Tools
+
+### `lsproto`
+
+A small companion DMOD application module, in [tools/lsproto](tools/lsproto),
+that lists every IP protocol number currently registered via
+`dmip_register_protocol()` (built on `dmip_for_each_protocol()` above).
+Built alongside `dmip` by this repo's own `CMakeLists.txt` and released as
+its own package - see [tools/lsproto/README.md](tools/lsproto/README.md).
 
 ## Documentation
 
@@ -337,6 +348,8 @@ dmip/
 ├── tests/
 │   ├── CMakeLists.txt
 │   └── dmip_test.c
+├── tools/
+│   └── lsproto/       # lsproto application module - see its own README
 ├── CMakeLists.txt
 ├── Makefile
 └── dmip.dmr
