@@ -1,7 +1,7 @@
 /**
- * @file dmip_protocols.c
- * @brief dmip_protocols - lists every IP protocol number currently
- *        registered with dmip via dmip_register_protocol()
+ * @file lsproto.c
+ * @brief lsproto - lists every IP protocol number currently registered
+ *        with dmip via dmip_register_protocol()
  */
 #include "dmod.h"
 #include "dmip.h"
@@ -50,7 +50,7 @@ int main(int argc, char *argv[])
     Dmod_Printf("Registered IP protocols:\n");
 
     size_t count = 0;
-    dmip_list_registered_protocols(print_protocol, &count);
+    dmip_for_each_protocol(print_protocol, &count);
 
     if (count == 0)
         Dmod_Printf("  (none)\n");

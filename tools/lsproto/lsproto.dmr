@@ -1,11 +1,11 @@
-# DMOD Resource File for dmip_protocols
+# DMOD Resource File for lsproto
 # This file specifies where resources should be installed
 #
-# dmip_protocols lives nested under tools/protocols/ inside this repo (a
-# second module built by the repo-root CMakeLists.txt via
-# add_subdirectory(tools/protocols)), so ${repo_dir}/${build_dir} below
+# lsproto lives nested under tools/lsproto/ inside this repo (a second
+# module built by the repo-root CMakeLists.txt via
+# add_subdirectory(tools/lsproto)), so ${repo_dir}/${build_dir} below
 # (which always resolve to the dmip repo/build root, not this
-# subdirectory) are prefixed with tools/protocols/ - same convention
+# subdirectory) are prefixed with tools/lsproto/ - same convention
 # dmip.dmr itself documents for its own (currently hypothetical) nesting
 # under a parent dmnet repo.
 
@@ -24,21 +24,21 @@ version=./${module}_version.txt => ${destination}/${module}_version.txt [origin=
 
 # === Documentation ===
 # Module documentation in markdown format for dmf-man tool
-docs=./docs => ${destination}/${module}/docs [origin=${repo_dir}/tools/protocols/docs]
+docs=./docs => ${destination}/${module}/docs [origin=${repo_dir}/tools/lsproto/docs]
 
 # README file
-readme=./README.md => ${destination}/${module}/README.md [origin=${repo_dir}/tools/protocols/README.md]
+readme=./README.md => ${destination}/${module}/README.md [origin=${repo_dir}/tools/lsproto/README.md]
 
 # === Header Files ===
-# dmip_protocols has no public header of its own (it's an application
-# module, not a library) - include/ only carries the auto-generated
-# dmip_protocols_defs.h, same "empty include/ + generated defs header"
-# shape every DMOD application module's package has.
-inc=./include => ${destination}/${module}/include [origin=${repo_dir}/tools/protocols/include] [origin=${build_dir}/tools/protocols/${module}_defs.h]
+# lsproto has no public header of its own (it's an application module, not
+# a library) - include/ only carries the auto-generated lsproto_defs.h,
+# same "empty include/ + generated defs header" shape every DMOD
+# application module's package has.
+inc=./include => ${destination}/${module}/include [origin=${repo_dir}/tools/lsproto/include] [origin=${build_dir}/tools/lsproto/${module}_defs.h]
 
 # === License ===
 # License file - shared at the dmip repo root
 license=./LICENSE => ${destination}/${module}/LICENSE [origin=${repo_dir}/LICENSE]
 
 # Adding itself
-dmr=./${module}.dmr => ${destination}/${module}/${module}.dmr [origin=${repo_dir}/tools/protocols/${module}.dmr]
+dmr=./${module}.dmr => ${destination}/${module}/${module}.dmr [origin=${repo_dir}/tools/lsproto/${module}.dmr]

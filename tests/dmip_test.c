@@ -1168,15 +1168,15 @@ typedef struct
 {
     uint8_t protocols[8];
     size_t  count;
-} list_protocols_result_t;
+} for_each_protocol_result_t;
 
 static void collect_protocol(uint8_t protocol, void* user_data)
 {
-    list_protocols_result_t* result = (list_protocols_result_t*)user_data;
+    for_each_protocol_result_t* result = (for_each_protocol_result_t*)user_data;
     result->protocols[result->count++] = protocol;
 }
 
-static bool list_protocols_result_contains(const list_protocols_result_t* result, uint8_t protocol)
+static bool for_each_protocol_result_contains(const for_each_protocol_result_t* result, uint8_t protocol)
 {
     for (size_t i = 0; i < result->count; i++)
     {
@@ -1186,23 +1186,23 @@ static bool list_protocols_result_contains(const list_protocols_result_t* result
     return false;
 }
 
-DMOD_TEST_STEP(list_registered_protocols_reports_every_registrant)
+DMOD_TEST_STEP(for_each_protocol_reports_every_registrant)
 {
     DMOD_TEST_EXPECT_EQ(dmip_register_protocol(TEST_PROTOCOL_A, record_call), 0);
     DMOD_TEST_EXPECT_EQ(dmip_register_protocol(TEST_PROTOCOL_B, record_call), 0);
 
-    list_protocols_result_t result = { .count = 0 };
-    dmip_list_registered_protocols(collect_protocol, &result);
+    for_each_protocol_result_t result = { .count = 0 };
+    dmip_for_each_protocol(collect_protocol, &result);
 
     DMOD_TEST_EXPECT_EQ(result.count, (size_t)2);
-    DMOD_TEST_EXPECT_TRUE(list_protocols_result_contains(&result, TEST_PROTOCOL_A));
-    DMOD_TEST_EXPECT_TRUE(list_protocols_result_contains(&result, TEST_PROTOCOL_B));
+    DMOD_TEST_EXPECT_TRUE(for_each_protocol_result_contains(&result, TEST_PROTOCOL_A));
+    DMOD_TEST_EXPECT_TRUE(for_each_protocol_result_contains(&result, TEST_PROTOCOL_B));
 
     dmip_unregister_protocol(TEST_PROTOCOL_A);
     dmip_unregister_protocol(TEST_PROTOCOL_B);
 }
 
-DMOD_TEST_STEP(list_registered_protocols_excludes_unregistered_and_default)
+DMOD_TEST_STEP(for_each_protocol_excludes_unregistered_and_default)
 {
     /* dmip_register_default_protocol() claims no protocol number of its
      * own - it must never show up in the enumeration. */
@@ -1210,19 +1210,19 @@ DMOD_TEST_STEP(list_registered_protocols_excludes_unregistered_and_default)
     DMOD_TEST_EXPECT_EQ(dmip_register_protocol(TEST_PROTOCOL_A, record_call), 0);
     dmip_unregister_protocol(TEST_PROTOCOL_A);
 
-    list_protocols_result_t result = { .count = 0 };
-    dmip_list_registered_protocols(collect_protocol, &result);
+    for_each_protocol_result_t result = { .count = 0 };
+    dmip_for_each_protocol(collect_protocol, &result);
 
     DMOD_TEST_EXPECT_EQ(result.count, (size_t)0);
 
     dmip_unregister_default_protocol();
 }
 
-DMOD_TEST_STEP(list_registered_protocols_with_null_callback_is_safe)
+DMOD_TEST_STEP(for_each_protocol_with_null_callback_is_safe)
 {
     DMOD_TEST_EXPECT_EQ(dmip_register_protocol(TEST_PROTOCOL_A, record_call), 0);
 
-    dmip_list_registered_protocols(NULL, NULL);
+    dmip_for_each_protocol(NULL, NULL);
 
     dmip_unregister_protocol(TEST_PROTOCOL_A);
 }
