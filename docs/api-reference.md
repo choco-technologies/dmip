@@ -86,5 +86,7 @@ receiving is dispatched by protocol number instead, see
 | `dmip_unregister_protocol(protocol)` | Undo the above. Safe to call for an unregistered protocol |
 | `dmip_register_default_protocol(handler)` | Register `handler` as the fallback for any packet whose protocol has no specific registrant. Only one at a time - `-EEXIST` if already set |
 | `dmip_unregister_default_protocol(void)` | Undo the above. Safe to call with none registered |
+| `dmip_protocol_list_func_t` | `void (*)(uint8_t protocol, void* user_data)` - callback type for `dmip_list_registered_protocols()` below |
+| `dmip_list_registered_protocols(callback, user_data)` | Call `callback` once per protocol number currently claimed via `dmip_register_protocol()` (not the default handler, which has no protocol number of its own). No-op if `callback` is `NULL`. See [tools/protocols](../tools/protocols) for a ready-made CLI tool built on this |
 
 See `include/dmip.h` for full parameter/return documentation on every function above.

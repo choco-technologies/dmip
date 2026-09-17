@@ -1231,6 +1231,43 @@ dmod_dmip_api_declaration(1.0, void, _unregister_default_protocol, ( void ))
 }
 
 /**
+ * @brief Implementation of dmip_list_registered_protocols() - see dmip.h
+ *
+ * Copies the registered protocol numbers out from under g_protocol_mutex
+ * before calling `callback` for any of them, rather than holding the lock
+ * into another module's code - same reasoning as dispatch_packet() above
+ * (a callback is free to call dmip_register_protocol()/
+ * _unregister_protocol() itself without deadlocking).
+ */
+dmod_dmip_api_declaration(1.0, void, _list_registered_protocols, ( dmip_protocol_list_func_t callback, void* user_data ))
+{
+    if (callback == NULL)
+        return;
+
+    dmosi_mutex_lock(g_protocol_mutex);
+    size_t count = dmlist_size(g_protocol_handlers);
+    uint8_t* protocols = (count > 0) ? Dmod_Malloc(count) : NULL;
+    if (protocols != NULL)
+    {
+        for (size_t i = 0; i < count; i++)
+        {
+            struct dmip_protocol_entry* entry = (struct dmip_protocol_entry*)dmlist_get(g_protocol_handlers, i);
+            protocols[i] = entry->protocol;
+        }
+    }
+    else
+    {
+        count = 0;
+    }
+    dmosi_mutex_unlock(g_protocol_mutex);
+
+    for (size_t i = 0; i < count; i++)
+        callback(protocols[i], user_data);
+
+    Dmod_Free(protocols);
+}
+
+/**
  * @brief Look up the registered (or default) handler for `protocol`,
  *        call it with `packet` if one exists, then free `packet`
  *

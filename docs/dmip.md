@@ -173,6 +173,14 @@ for the duration of the call (same contract `dmnetbridge.h`'s
 default handler, or neither) returns, so a handler that wants to keep
 data past the call must copy it out itself.
 
+`dmip_list_registered_protocols(callback, user_data)` enumerates the same
+dispatch table for introspection - one call to `callback` per registered
+protocol number, copied out from under the dispatch table's mutex before
+any of them are invoked (same "don't hold the lock into another module's
+code" discipline `dispatch_packet()` follows). `tools/protocols` is a small
+DMOD application module built on top of it - see its own README for how to
+run it.
+
 ## Byte buffers, not packed structs
 
 Like `lib/dmarp/src/dmarp.c` and `tools/ip/src/ip.c`, headers are

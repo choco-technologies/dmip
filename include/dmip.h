@@ -168,6 +168,34 @@ dmod_dmip_api(1.0, int, _register_default_protocol, ( dmip_protocol_handler_t ha
  */
 dmod_dmip_api(1.0, void, _unregister_default_protocol, ( void ));
 
+/**
+ * @brief Callback invoked once per registered protocol by
+ *        dmip_list_registered_protocols()
+ *
+ * @param protocol  A protocol/next-header number currently claimed via
+ *                   dmip_register_protocol()
+ * @param user_data Passed through from dmip_list_registered_protocols()
+ *                   unchanged
+ */
+typedef void (*dmip_protocol_list_func_t)( uint8_t protocol, void* user_data );
+
+/**
+ * @brief Enumerate every protocol number currently claimed via
+ *        dmip_register_protocol(), calling `callback` once per entry
+ *
+ * Does not include the registered default handler (dmip_register_default_
+ * protocol()), which has no protocol number of its own - see
+ * dmip_register_default_protocol()'s own doc comment. The order entries are
+ * visited in is unspecified (registration order in the current
+ * implementation, but not a guaranteed contract). Safe to call with none
+ * registered (`callback` is simply never invoked).
+ *
+ * @param callback  Invoked once per registered protocol number. Nothing
+ *                   happens if NULL
+ * @param user_data Passed through to `callback` unchanged
+ */
+dmod_dmip_api(1.0, void, _list_registered_protocols, ( dmip_protocol_list_func_t callback, void* user_data ));
+
 /* ============================================================================
  *                      Common constants
  * ========================================================================== */

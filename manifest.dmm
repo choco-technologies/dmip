@@ -1,5 +1,6 @@
 # Include dynamically generated versions list from latest release
 $include https://github.com/choco-technologies/dmip/releases/download/vlatest/versions.dmm
 
-# Module entry with version placeholder - expanded by $version-available
-dmip https://github.com/choco-technologies/dmip/releases/download/v<version>/dmip-v<version>-<arch_name>.zip
+# Module entries with version placeholder - expanded by $version-available
+dmip           https://github.com/choco-technologies/dmip/releases/download/v<version>/dmip-v<version>-<arch_name>.zip
+dmip_protocols https://github.com/choco-technologies/dmip/releases/download/v<version>/dmip_protocols-v<version>-<arch_name>.zip
