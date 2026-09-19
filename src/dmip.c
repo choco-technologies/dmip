@@ -102,6 +102,7 @@ struct dmip_protocol_entry
 {
     uint8_t                  protocol;
     dmip_protocol_handler_t  handler;
+    char*                    module_name;  /**< Registrant, held resident while this entry lives */
 };
 
 /**
@@ -116,6 +117,11 @@ static dmosi_mutex_t     g_protocol_mutex = NULL;
  *        or NULL if none - guarded by g_protocol_mutex
  */
 static dmip_protocol_handler_t g_default_handler = NULL;
+
+/**
+ * @brief Registrant of g_default_handler, held resident while it stands
+ */
+static char* g_default_handler_module = NULL;
 
 /* ---- Checksum ---- */
 
@@ -709,7 +715,7 @@ static struct dmip_reassembly_entry* find_or_create_entry(dmip_family_t family, 
 
     entry->family = family;
     memcpy(entry->key, key, DMIP_REASSEMBLY_KEY_LEN);
-    entry->chunks = dmlist_create(Dmod_GetCurrentAllocatorName());
+    entry->chunks = dmlist_create(DMOD_CURRENT_ALLOCATOR);
     entry->total_length_known = false;
     entry->total_length = 0;
     entry->last_seen = dmosi_get_tick_count();
@@ -1144,9 +1150,9 @@ static int compare_protocol(const void* data, const void* user_data)
 /**
  * @brief Implementation of dmip_register_protocol() - see dmip.h
  */
-dmod_dmip_api_declaration(1.0, int, _register_protocol, ( uint8_t protocol, dmip_protocol_handler_t handler ))
+dmod_dmip_api_declaration(1.0, int, _register_protocol_ex, ( uint8_t protocol, dmip_protocol_handler_t handler, const char* module_name ))
 {
-    if (handler == NULL)
+    if (handler == NULL || module_name == NULL)
         return -EINVAL;
 
     dmosi_mutex_lock(g_protocol_mutex);
@@ -1167,12 +1173,18 @@ dmod_dmip_api_declaration(1.0, int, _register_protocol, ( uint8_t protocol, dmip
         {
             entry->protocol = protocol;
             entry->handler = handler;
-            if (dmlist_push_back(g_protocol_handlers, entry))
+            entry->module_name = Dmod_StrDup(module_name);
+
+            if (entry->module_name != NULL && dmlist_push_back(g_protocol_handlers, entry))
             {
+                /* A registrant like dmicmp owns no thread and no process -
+                 * this reference is the only thing keeping it resident. */
+                Dmod_BeginUsage(entry->module_name);
                 result = 0;
             }
             else
             {
+                Dmod_Free(entry->module_name);
                 Dmod_Free(entry);
                 result = -ENOMEM;
             }
@@ -1194,6 +1206,8 @@ dmod_dmip_api_declaration(1.0, void, _unregister_protocol, ( uint8_t protocol ))
     if (entry != NULL)
     {
         dmlist_remove(g_protocol_handlers, entry, compare_pointer);
+        Dmod_EndUsage(entry->module_name);
+        Dmod_Free(entry->module_name);
         Dmod_Free(entry);
     }
 
@@ -1203,9 +1217,9 @@ dmod_dmip_api_declaration(1.0, void, _unregister_protocol, ( uint8_t protocol ))
 /**
  * @brief Implementation of dmip_register_default_protocol() - see dmip.h
  */
-dmod_dmip_api_declaration(1.0, int, _register_default_protocol, ( dmip_protocol_handler_t handler ))
+dmod_dmip_api_declaration(1.0, int, _register_default_protocol_ex, ( dmip_protocol_handler_t handler, const char* module_name ))
 {
-    if (handler == NULL)
+    if (handler == NULL || module_name == NULL)
         return -EINVAL;
 
     dmosi_mutex_lock(g_protocol_mutex);
@@ -1213,7 +1227,16 @@ dmod_dmip_api_declaration(1.0, int, _register_default_protocol, ( dmip_protocol_
     int result = (g_default_handler != NULL) ? -EEXIST : 0;
     if (result == 0)
     {
-        g_default_handler = handler;
+        g_default_handler_module = Dmod_StrDup(module_name);
+        if (g_default_handler_module == NULL)
+        {
+            result = -ENOMEM;
+        }
+        else
+        {
+            g_default_handler = handler;
+            Dmod_BeginUsage(g_default_handler_module);
+        }
     }
 
     dmosi_mutex_unlock(g_protocol_mutex);
@@ -1226,7 +1249,15 @@ dmod_dmip_api_declaration(1.0, int, _register_default_protocol, ( dmip_protocol_
 dmod_dmip_api_declaration(1.0, void, _unregister_default_protocol, ( void ))
 {
     dmosi_mutex_lock(g_protocol_mutex);
+
     g_default_handler = NULL;
+    if (g_default_handler_module != NULL)
+    {
+        Dmod_EndUsage(g_default_handler_module);
+        Dmod_Free(g_default_handler_module);
+        g_default_handler_module = NULL;
+    }
+
     dmosi_mutex_unlock(g_protocol_mutex);
 }
 
@@ -1365,10 +1396,19 @@ int dmod_init(const Dmod_Config_t *Config)
 {
     (void)Config;
 
-    g_reassembly = dmlist_create(Dmod_GetCurrentAllocatorName());
+    /* DMOD_CURRENT_ALLOCATOR, not Dmod_GetCurrentAllocatorName(): dmod_init() runs on
+     * the thread of whoever enabled this module, so the "current" allocator is
+     * that process's - and allocation tracking bulk-frees a process's memory
+     * when it exits. State that belongs to the module has to be tagged to the
+     * module, or it dies with the first process that happened to pull it in,
+     * leaving this pointer aimed at whatever gets allocated there next. The
+     * macro resolves to this module's own name here and to the running
+     * process's allocator in an application module, so it stays correct if
+     * this code is ever reused in one. */
+    g_reassembly = dmlist_create(DMOD_CURRENT_ALLOCATOR);
     g_reassembly_mutex = dmosi_mutex_create(false);
     g_id_mutex = dmosi_mutex_create(false);
-    g_protocol_handlers = dmlist_create(Dmod_GetCurrentAllocatorName());
+    g_protocol_handlers = dmlist_create(DMOD_CURRENT_ALLOCATOR);
     g_protocol_mutex = dmosi_mutex_create(false);
     if (
         g_reassembly == NULL || g_reassembly_mutex == NULL || g_id_mutex == NULL

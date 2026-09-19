@@ -127,16 +127,40 @@ typedef void (*dmip_protocol_handler_t)( dmip_family_t family, dmnetif_iface_t i
  * a generic receive function (dmip_v4_receive()/_v6_receive()/_receive()
  * do not exist anymore - see docs/dmip.md).
  *
- * @param protocol IP protocol/next-header number to claim (e.g.
- *                  DMIP_PROTO_UDP)
- * @param handler  Callback to invoke for every packet matching `protocol`
+ * A registrant is typically a module that does nothing on its own - it
+ * answers packets on whatever thread delivers them and owns no thread or
+ * process of its own (dmicmp is the example). Nothing would otherwise keep
+ * such a module resident, so dmip holds a usage reference on it for as long
+ * as the registration stands, the same way dmvfs holds one on a filesystem
+ * module for as long as it is mounted. That is what `module_name` is for:
+ * dmip cannot work out who is calling, because a library module's
+ * registration runs on whatever thread happened to load it, so
+ * Dmod_GetCurrentContext() names that thread's process rather than the
+ * registrant.
  *
- * @return 0 on success, -EINVAL if `handler` is NULL, -EEXIST if
- *         `protocol` is already registered (call
+ * Use the dmip_register_protocol() macro rather than calling this directly
+ * and it fills `module_name` in with the caller's own DMOD_MODULE_NAME.
+ *
+ * @param protocol    IP protocol/next-header number to claim (e.g.
+ *                    DMIP_PROTO_UDP)
+ * @param handler     Callback to invoke for every packet matching `protocol`
+ * @param module_name Registrant's module name, held resident until the
+ *                    registration is released
+ *
+ * @return 0 on success, -EINVAL if `handler` or `module_name` is NULL,
+ *         -EEXIST if `protocol` is already registered (call
  *         dmip_unregister_protocol() first if you mean to replace it),
  *         -ENOMEM if the registration itself could not be allocated
  */
-dmod_dmip_api(1.0, int, _register_protocol, ( uint8_t protocol, dmip_protocol_handler_t handler ));
+dmod_dmip_api(1.0, int, _register_protocol_ex, ( uint8_t protocol, dmip_protocol_handler_t handler, const char* module_name ));
+
+/**
+ * @brief Register for an IP protocol number, as this module
+ *
+ * Wrapper over dmip_register_protocol_ex() that names the caller, mirroring
+ * how Dmod_Malloc() wraps Dmod_MallocEx().
+ */
+#define dmip_register_protocol(protocol, handler)   dmip_register_protocol_ex((protocol), (handler), DMOD_MODULE_NAME)
 
 /**
  * @brief Undo dmip_register_protocol() - safe to call for a protocol that
@@ -154,13 +178,26 @@ dmod_dmip_api(1.0, void, _unregister_protocol, ( uint8_t protocol ));
  * second one before unregistering the first fails rather than silently
  * replacing it.
  *
- * @param handler Callback to invoke for every packet with no more
- *                 specific registrant
+ * Holds a usage reference on `module_name` for as long as the registration
+ * stands - see dmip_register_protocol_ex() for why the name has to be passed
+ * in. Use the dmip_register_default_protocol() macro to have it filled in.
  *
- * @return 0 on success, -EINVAL if `handler` is NULL, -EEXIST if a
- *         default handler is already registered
+ * @param handler     Callback to invoke for every packet with no more
+ *                    specific registrant
+ * @param module_name Registrant's module name, held resident until the
+ *                    registration is released
+ *
+ * @return 0 on success, -EINVAL if `handler` or `module_name` is NULL,
+ *         -EEXIST if a default handler is already registered
  */
-dmod_dmip_api(1.0, int, _register_default_protocol, ( dmip_protocol_handler_t handler ));
+dmod_dmip_api(1.0, int, _register_default_protocol_ex, ( dmip_protocol_handler_t handler, const char* module_name ));
+
+/**
+ * @brief Register a fallback handler, as this module
+ *
+ * Wrapper over dmip_register_default_protocol_ex() that names the caller.
+ */
+#define dmip_register_default_protocol(handler)   dmip_register_default_protocol_ex((handler), DMOD_MODULE_NAME)
 
 /**
  * @brief Undo dmip_register_default_protocol() - safe to call when no
