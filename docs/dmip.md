@@ -116,9 +116,10 @@ the Ethertype, strips the 14-byte L2 header, and feeds the rest through
 `dmip_v4_reassemble()`/`_v6_reassemble()` exactly as before; a completed
 packet's header is then parsed once more purely to read its protocol
 number (IPv4's `protocol` field / IPv6's `next_header`), and
-`dispatch_packet()` hands it to whichever module registered for that
-number, a registered default handler, or drops it if neither exists - see
-"Protocol dispatch" below.
+`dispatch_packet()` hands it to whichever loaded module's
+`dmip_protocol_numbers()` DIF implementation claims that number, one that
+claims `DMIP_PROTO_DEFAULT` if none matches, or drops it if neither
+exists - see "Protocol dispatch" below.
 
 There is no `dmip_v6_send()`: resolving a destination MAC for IPv6 uses
 NDP (RFC 4861), not ARP, and there is no NDP module in this tree yet -
@@ -152,34 +153,64 @@ the packet, see `protocol != DMIP_PROTO_UDP`, free it and return
 `-EPROTO`). That's silent, permanent data loss for whoever actually
 wanted it, and it only gets worse as more protocols are added.
 
-The fix: `dmip_register_protocol(protocol, handler)` registers `handler`
-as the *only* recipient of packets whose header names that protocol
-number (`DMIP_PROTO_UDP`, `_TCP`, `_ICMP`, ... - the same numbering IPv4's
-`protocol` field and IPv6's `next_header` already share). A single
-`dmip_register_default_protocol(handler)` covers whatever protocol number
-nobody else claimed. `dmudp` is the first (only, today) real consumer -
-see [dmudp.md](../../dmudp/docs/dmudp.md) - registering itself for
-`DMIP_PROTO_UDP` in its own `dmod_init()` and owning its own receive queue
-downstream of that registration, the same shape dmip's queue used to be.
-This mirrors how real IP stacks dispatch by protocol number (Linux's
+The first fix for that was a private dispatch table: `dmip_register_protocol(
+protocol, handler)` made `handler` the sole recipient of packets naming that
+protocol number, and dmip held a `Dmod_BeginUsage()` reference on the
+registrant for as long as the registration stood - the same shape `dmvfs`
+uses for a mounted filesystem module - since a registrant like `dmicmp` owns
+no thread or process of its own and nothing else would keep it resident.
+That table itself turned out to be its own problem: `dmicmp` couldn't be
+restarted without first unregistering (which needs `dmip` itself to still be
+working), `dmip` in turn couldn't be reloaded while it held a usage
+reference on `dmicmp`, and if a registrant ever crashed instead of cleanly
+calling `dmip_unregister_protocol()`, dmip would keep calling a now-stale
+function pointer with nothing telling it otherwise.
+
+The table is gone now. A module claims a protocol by implementing two DIFs
+(see `include/dmip.h`'s "Protocol handler DIF" section) instead of calling
+a registration function: `dmip_protocol_numbers(out_protocols,
+max_protocols)` reports which `DMIP_PROTO_*` number(s) (and/or the
+`DMIP_PROTO_DEFAULT` fallback marker) it currently wants, and
+`dmip_protocol_receive(family, iface, packet, packet_len)` is called with a
+matching packet. `dispatch_packet()` in `src/dmip.c` discovers implementors
+fresh on every single packet via `Dmod_GetNextDifModule()`/
+`_GetDifFunction()` (the same discovery dmip's own `packet_received` DIF
+implementation is itself found through) rather than consulting anything it
+owns - an exact protocol claim always wins over a `DMIP_PROTO_DEFAULT`
+claim, and the packet is dropped if nobody claims either. Because nothing
+is stored, nothing needs unregistering: a crashed, disabled, or unloaded
+module simply stops being discovered, and `dmip` itself holds no reference
+on anyone, so the two modules no longer block each other's reload. `dmicmp`
+is the one module claiming a fallback today - it claims `DMIP_PROTO_ICMP`,
+`DMIP_PROTO_ICMPV6`, and `DMIP_PROTO_DEFAULT` all from one implementation,
+to answer any otherwise-unclaimed packet with an ICMP Destination
+Unreachable. `dmudp`/`dmtcp` each claim exactly one protocol number. This
+still mirrors how real IP stacks dispatch by protocol number (Linux's
 `inet_add_protocol()` table, BSD's `protosw`) - dmip was already a
 dispatcher one level up (by Ethertype, via the `packet_received` DIF); this
-is the same idea one level further in.
+is the same idea one level further in, just discovered instead of
+registered.
 
-A registered handler receives a **borrowed** `packet` pointer, valid only
-for the duration of the call (same contract `dmnetbridge.h`'s
-`packet_received` DIF already documents for its own `frame` parameter) -
-`dispatch_packet()` in `src/dmip.c` frees it right after the handler (or
-default handler, or neither) returns, so a handler that wants to keep
-data past the call must copy it out itself.
+The accepted tradeoff: dispatching a packet now costs a scan over every
+loaded module implementing `dmip_protocol_numbers()` instead of one table
+lookup. Nothing in this tree implements more than a handful of protocol
+handlers today, so this is not a concern in practice - if it ever becomes
+one, the discovery results can be cached without changing this DIF-based
+design.
 
-`dmip_for_each_protocol(callback, user_data)` enumerates the same dispatch
-table for introspection - one call to `callback` per registered protocol
-number, made while the dispatch table's mutex is held (unlike
-`dispatch_packet()`, a `callback` here must not call back into
-`dmip_register_protocol()`/`_unregister_protocol()`/`dmip_for_each_protocol()`
-itself, or it will deadlock). `tools/lsproto` is a small DMOD application
-module built on top of it - see its own README for how to run it.
+An implementation receives a **borrowed** `packet` pointer, valid only for
+the duration of the call (same contract `dmnetbridge.h`'s `packet_received`
+DIF already documents for its own `frame` parameter) - `dispatch_packet()`
+frees it right after the matched implementation (or none) returns, so an
+implementation that wants to keep data past the call must copy it out
+itself.
+
+`dmip_for_each_protocol(callback, user_data)` enumerates the same DIF
+implementors for introspection - one call to `callback` per (module,
+protocol) pair currently claimed (never `DMIP_PROTO_DEFAULT`, which has no
+protocol number of its own), with the claiming module's name. `tools/
+lsproto` is a small DMOD application module built on top of it - see its
+own README for how to run it.
 
 ## Byte buffers, not packed structs
 
@@ -200,7 +231,6 @@ would corrupt every packet silently.
 - `dmnetbridge` - `dmnetbridge_send()`/`_get_source_address()`/`_get_mtu()`
   for `dmip_v4_send()`, and the `packet_received` DIF dmip implements for
   receiving
-- `dmlist` - fragment reassembly bookkeeping, and the protocol dispatch
-  table
-- `dmosi` - mutexes guarding reassembly/identification/protocol-dispatch
-  state, plus `dmosi_get_tick_count()` for reassembly timeouts
+- `dmlist` - fragment reassembly bookkeeping
+- `dmosi` - mutexes guarding reassembly/identification state, plus
+  `dmosi_get_tick_count()` for reassembly timeouts

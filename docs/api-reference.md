@@ -73,20 +73,23 @@ No `dmip_v6_send()` yet - see [dmip.md](dmip.md#send--receive).
 | `dmip_header_t` | `{ family; union { dmip_v4_header_t v4; dmip_v6_header_t v6; } header; }` - set `family`, fill in the matching union member |
 | `dmip_send(header, payload, payload_len, arp_timeout_ms)` | Dispatches to `dmip_v4_send()` for `dmip_family_v4`; `-ENOSYS` for `dmip_family_v6` (no `dmip_v6_send()` yet); `-EINVAL` if `header` is `NULL` or `family` is neither |
 
-### Protocol registration
+### Protocol handler DIF
 
 There is no `dmip_receive()`/`dmip_v4_receive()`/`_v6_receive()` anymore -
 receiving is dispatched by protocol number instead, see
-[dmip.md](dmip.md#protocol-dispatch) for why.
+[dmip.md](dmip.md#protocol-dispatch) for why. There is also no
+`dmip_register_protocol()`/`_register_default_protocol()` anymore - a
+module claims a protocol by implementing the two DIFs below, discovered
+fresh by dmip on every dispatch instead of registered into a table dmip
+owns (see [dmip.md](dmip.md#protocol-dispatch) for why that changed).
 
-| Function | Description |
-|----------|--------------|
-| `dmip_protocol_handler_t` | `void (*)(dmip_family_t family, dmnetif_iface_t iface, const uint8_t* packet, size_t packet_len)` - callback type for the two `_register_*` functions below. `packet` is borrowed, valid only for the call |
-| `dmip_register_protocol(protocol, handler)` | Register `handler` as the sole receiver of packets whose protocol/next_header number is `protocol` (e.g. `DMIP_PROTO_UDP`). `0` on success, `-EINVAL` (NULL handler), `-EEXIST` (already registered), `-ENOMEM` |
-| `dmip_unregister_protocol(protocol)` | Undo the above. Safe to call for an unregistered protocol |
-| `dmip_register_default_protocol(handler)` | Register `handler` as the fallback for any packet whose protocol has no specific registrant. Only one at a time - `-EEXIST` if already set |
-| `dmip_unregister_default_protocol(void)` | Undo the above. Safe to call with none registered |
-| `dmip_protocol_visitor_t` | `void (*)(uint8_t protocol, void* user_data)` - callback type for `dmip_for_each_protocol()` below |
-| `dmip_for_each_protocol(callback, user_data)` | Call `callback` once per protocol number currently claimed via `dmip_register_protocol()` (not the default handler, which has no protocol number of its own). No-op if `callback` is `NULL`. See [tools/lsproto](../tools/lsproto) for a ready-made CLI tool built on this |
+| Function / Constant | Description |
+|----------------------|--------------|
+| `DMIP_MAX_PROTOCOL_NUMBERS` | Capacity a caller must give `dmip_protocol_numbers()`'s `out_protocols` - 4, enough for every implementor in this tree today |
+| `DMIP_PROTO_DEFAULT` | `0x100` - sentinel `dmip_protocol_numbers()` can report to also serve as the fallback for any protocol nobody else claims. Never collides with a real (single-byte) protocol number |
+| `dmip_protocol_receive` (DIF) | `void dmip_<module>_protocol_receive(dmip_family_t family, dmnetif_iface_t iface, const uint8_t* packet, size_t packet_len)` - implement via `dmod_dmip_dif_api_declaration(1.0, <module>, void, _protocol_receive, (...))`. `packet` is borrowed, valid only for the call |
+| `dmip_protocol_numbers` (DIF) | `size_t dmip_<module>_protocol_numbers(uint16_t* out_protocols, size_t max_protocols)` - implement via `dmod_dmip_dif_api_declaration(1.0, <module>, size_t, _protocol_numbers, (...))`. Returns how many of `DMIP_PROTO_*`/`DMIP_PROTO_DEFAULT` it wrote to `out_protocols`, queried fresh on every dispatch |
+| `dmip_protocol_visitor_t` | `void (*)(uint8_t protocol, const char* module_name, void* user_data)` - callback type for `dmip_for_each_protocol()` below |
+| `dmip_for_each_protocol(callback, user_data)` | Call `callback` once per (module, protocol) pair currently claimed via the DIFs above (never `DMIP_PROTO_DEFAULT`, which has no protocol number of its own). No-op if `callback` is `NULL`. See [tools/lsproto](../tools/lsproto) for a ready-made CLI tool built on this |
 
 See `include/dmip.h` for full parameter/return documentation on every function above.

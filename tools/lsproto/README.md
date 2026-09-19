@@ -3,8 +3,8 @@
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](../../LICENSE)
 
 `lsproto` is a small DMOD application module: it lists every IP
-protocol/next-header number currently registered with `dmip` via
-`dmip_register_protocol()`, using `dmip`'s own
+protocol/next-header number currently claimed by some loaded module via
+`dmip`'s protocol handler DIF, using `dmip`'s own
 `dmip_for_each_protocol()` (see
 [../../docs/api-reference.md](../../docs/api-reference.md)).
 
@@ -26,12 +26,12 @@ instead of fetching `develop` from GitHub.
 
 ## Usage
 
-Prints one line per registered protocol:
+Prints one line per claimed protocol, with the module name that claims it:
 
 ```
 Registered IP protocols:
-   17  UDP
-    1  ICMP
+   17  UDP            dmudp
+    1  ICMP           dmicmp
 ```
 
 With nothing registered:

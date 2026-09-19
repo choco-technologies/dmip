@@ -28,25 +28,26 @@ extern "C" {
  *
  * dmip depends on dmroute (only for the address type - dmip_addr_t is a
  * re-export, see below) and dmnetif (only for the dmnetif_iface_t type
- * passed to a registered protocol handler - see "Protocol registration"
- * below - dmip never calls a dmnetif function directly). Routing, ARP
- * resolution, and actual frame I/O all live in dmnetbridge now:
- * dmip_v4_send() calls dmnetbridge_send()/_get_source_address()/_get_mtu()
- * once it has a payload ready. Receiving has no public pull API anymore
+ * passed to a protocol handler - see "Protocol handler DIF" below - dmip
+ * never calls a dmnetif function directly). Routing, ARP resolution, and
+ * actual frame I/O all live in dmnetbridge now: dmip_v4_send() calls
+ * dmnetbridge_send()/_get_source_address()/_get_mtu() once it has a
+ * payload ready. Receiving has no public pull API anymore
  * (dmip_v4_receive()/_v6_receive()/_receive() were removed) - instead,
  * dmip implements dmnetbridge's packet_received DIF (fed by whichever
  * thread is pumping an interface - see dmnetbridge.h) and dispatches
- * each completed packet to whichever module registered for its IP
- * protocol number via dmip_register_protocol(), or a registered default
- * handler, or drops it if nobody claimed it - see "Protocol
- * registration" below and dmip.c's "Protocol dispatch" section. Also
- * depends on dmlist (fragment reassembly bookkeeping, and the protocol
- * registration table) and dmosi (mutexes and tick count for timeouts).
- * There is exactly one reassembly table, one protocol dispatch table,
- * and one pair of identification counters per system, so every function
- * here is plain Built-in API (dmod_dmip_api) - dmip additionally
- * implements dmnetbridge's packet_received DIF (see dmip.c), which is
- * the one part of this module that isn't.
+ * each completed packet by discovering, fresh on every packet, whichever
+ * loaded module's dmip_protocol_numbers() DIF implementation claims its
+ * IP protocol number (or the DMIP_PROTO_DEFAULT fallback), or drops it
+ * if nobody claims it - see "Protocol handler DIF" below and dmip.c's
+ * "Protocol dispatch" section. Also depends on dmlist (fragment
+ * reassembly bookkeeping) and dmosi (mutexes and tick count for
+ * timeouts). There is exactly one reassembly table and one pair of
+ * identification counters per system, so most functions here are plain
+ * Built-in API (dmod_dmip_api) - dmip additionally implements
+ * dmnetbridge's packet_received DIF and discovers/calls other modules'
+ * dmip_protocol_receive()/_protocol_numbers() DIF implementations (see
+ * dmip.c), which is the one part of this module that isn't.
  */
 
 /* ============================================================================
@@ -92,149 +93,122 @@ typedef dmroute_addr_t dmip_addr_t;
 #define DMIP_PROTO_ICMPV6         58u
 
 /* ============================================================================
- *                      Protocol registration
+ *                      Protocol handler DIF
  * ========================================================================== */
 
 /**
- * @brief Callback registered via dmip_register_protocol()/
- *        _register_default_protocol() to receive completed IP packets
+ * @brief Maximum number of entries a single dmip_protocol_numbers()
+ *        implementation may write to `out_protocols` in one call
  *
- * Called by dmip's own implementation of dmnetbridge's packet_received
- * DIF (see dmnetbridge.h and dmip.c's "Protocol dispatch" section) from
- * whatever thread is pumping the interface the packet arrived on -
- * usually not the same thread that will eventually want the data, so a
- * handler that needs to keep it past this call (e.g. to hand it to a
- * waiting dmudp_receive()-style caller) must copy it out itself.
+ * Comfortably above what anything in this tree needs today - dmicmp is
+ * the only module claiming more than one entry (ICMP, ICMPv6, and the
+ * DMIP_PROTO_DEFAULT fallback marker: three).
+ */
+#define DMIP_MAX_PROTOCOL_NUMBERS 4u
+
+/**
+ * @brief Sentinel a module can report from dmip_protocol_numbers(),
+ *        alongside or instead of real protocol numbers, to also serve as
+ *        the fallback for any packet whose protocol nobody else claims
+ *
+ * Never equal to a real on-wire protocol/next-header number - those are a
+ * single byte (0-255) as carried in IPv4's `protocol` field / IPv6's
+ * `next_header` - so 0x100 can never collide with one.
+ */
+#define DMIP_PROTO_DEFAULT 0x100u
+
+/**
+ * @brief DIF implemented by a module that wants completed IP packets for
+ *        whichever protocol number(s) its own dmip_protocol_numbers()
+ *        implementation (below) currently reports
+ *
+ * Replaces the old dmip_register_protocol()/_register_default_protocol()
+ * callback registration, which had dmip hold a direct function pointer
+ * plus a Dmod_BeginUsage() reference forcing the registrant to stay
+ * resident until it explicitly unregistered - the same shape dmvfs uses
+ * for a mounted filesystem module. That made a registrant like dmicmp
+ * impossible to restart without unregistering first, and left a stale,
+ * still-callable function pointer behind if it ever crashed instead of
+ * unregistering cleanly. A DIF implementation needs neither: dmip
+ * discovers implementors fresh on every dispatch via
+ * Dmod_GetNextDifModule()/_GetDifFunction() (see dispatch_packet() in
+ * dmip.c) rather than storing anything - a module that crashes, is
+ * disabled, or is unloaded simply stops being discovered, with nothing
+ * left over to call by accident and nothing keeping it loaded against its
+ * own lifecycle. The tradeoff: dispatching a packet now costs a scan over
+ * every loaded module implementing this DIF instead of one table lookup -
+ * accepted for how few protocol handlers exist in this tree today, with
+ * room to optimize later (e.g. caching discovery results) if that changes.
+ *
+ * Called on whatever thread is pumping the interface the packet arrived
+ * on - usually not the same thread that will eventually want the data, so
+ * an implementation that needs to keep `packet` past this call (e.g. to
+ * hand it to a waiting dmudp_receive()-style caller) must copy it out
+ * itself. `packet` is only valid for the duration of the call - dmip
+ * frees it once the matched implementation (if any) returns.
  *
  * @param family     dmip_family_v4 or _v6
  * @param iface      Interface the packet arrived on
  * @param packet     Complete reassembled wire-format IP packet (header +
- *                    payload). Only valid for the duration of the call -
- *                    dmip frees it once every registered/default handler
- *                    (whichever one matched) has returned
+ *                    payload)
  * @param packet_len Length of `packet` in bytes
  */
-typedef void (*dmip_protocol_handler_t)( dmip_family_t family, dmnetif_iface_t iface, const uint8_t* packet, size_t packet_len );
+dmod_dmip_dif(1.0, void, _protocol_receive, ( dmip_family_t family, dmnetif_iface_t iface, const uint8_t* packet, size_t packet_len ));
 
 /**
- * @brief Register `handler` as the receiver for IP protocol number `protocol`
+ * @brief DIF a module implements alongside dmip_protocol_receive() to
+ *        report which IP protocol/next-header number(s) it currently
+ *        wants delivered to it
  *
- * Every completed packet (either family - `protocol` is IPv4's `protocol`
- * field and IPv6's `next_header`, the same numbering space, see
- * DMIP_PROTO_* above) whose header names this `protocol` is delivered to
- * `handler` and nobody else - see dmip.c's "Protocol dispatch" section
- * for why this replaced dmip handing every packet to whoever last called
- * a generic receive function (dmip_v4_receive()/_v6_receive()/_receive()
- * do not exist anymore - see docs/dmip.md).
+ * Queried fresh on every dispatch (see dispatch_packet() in dmip.c)
+ * rather than once at registration time - a module is free to change its
+ * mind between calls (e.g. claim nothing until its own state is ready),
+ * and dmip never has to be told when that happens. Include
+ * DMIP_PROTO_DEFAULT in the returned list to also serve as the fallback
+ * for any protocol nobody else claims - dmicmp is the one module in this
+ * tree doing both today (ICMP, ICMPv6, and the fallback, all from one
+ * implementation).
  *
- * A registrant is typically a module that does nothing on its own - it
- * answers packets on whatever thread delivers them and owns no thread or
- * process of its own (dmicmp is the example). Nothing would otherwise keep
- * such a module resident, so dmip holds a usage reference on it for as long
- * as the registration stands, the same way dmvfs holds one on a filesystem
- * module for as long as it is mounted. That is what `module_name` is for:
- * dmip cannot work out who is calling, because a library module's
- * registration runs on whatever thread happened to load it, so
- * Dmod_GetCurrentContext() names that thread's process rather than the
- * registrant.
+ * @param out_protocols Output: up to `max_protocols` claimed protocol
+ *                        numbers (DMIP_PROTO_* and/or DMIP_PROTO_DEFAULT)
+ * @param max_protocols Capacity of `out_protocols` - DMIP_MAX_PROTOCOL_NUMBERS
+ *                        is enough for every implementor in this tree today
  *
- * Use the dmip_register_protocol() macro rather than calling this directly
- * and it fills `module_name` in with the caller's own DMOD_MODULE_NAME.
- *
- * @param protocol    IP protocol/next-header number to claim (e.g.
- *                    DMIP_PROTO_UDP)
- * @param handler     Callback to invoke for every packet matching `protocol`
- * @param module_name Registrant's module name, held resident until the
- *                    registration is released
- *
- * @return 0 on success, -EINVAL if `handler` or `module_name` is NULL,
- *         -EEXIST if `protocol` is already registered (call
- *         dmip_unregister_protocol() first if you mean to replace it),
- *         -ENOMEM if the registration itself could not be allocated
+ * @return Number of entries written to `out_protocols` (0 if this module
+ *         currently claims none)
  */
-dmod_dmip_api(1.0, int, _register_protocol_ex, ( uint8_t protocol, dmip_protocol_handler_t handler, const char* module_name ));
+dmod_dmip_dif(1.0, size_t, _protocol_numbers, ( uint16_t* out_protocols, size_t max_protocols ));
 
 /**
- * @brief Register for an IP protocol number, as this module
- *
- * Wrapper over dmip_register_protocol_ex() that names the caller, mirroring
- * how Dmod_Malloc() wraps Dmod_MallocEx().
- */
-#define dmip_register_protocol(protocol, handler)   dmip_register_protocol_ex((protocol), (handler), DMOD_MODULE_NAME)
-
-/**
- * @brief Undo dmip_register_protocol() - safe to call for a protocol that
- *        was never registered (a no-op)
- *
- * @param protocol IP protocol/next-header number to release
- */
-dmod_dmip_api(1.0, void, _unregister_protocol, ( uint8_t protocol ));
-
-/**
- * @brief Register `handler` as the fallback for any packet whose protocol
- *        has no dmip_register_protocol() registrant
- *
- * There is only ever one default handler, not a list - registering a
- * second one before unregistering the first fails rather than silently
- * replacing it.
- *
- * Holds a usage reference on `module_name` for as long as the registration
- * stands - see dmip_register_protocol_ex() for why the name has to be passed
- * in. Use the dmip_register_default_protocol() macro to have it filled in.
- *
- * @param handler     Callback to invoke for every packet with no more
- *                    specific registrant
- * @param module_name Registrant's module name, held resident until the
- *                    registration is released
- *
- * @return 0 on success, -EINVAL if `handler` or `module_name` is NULL,
- *         -EEXIST if a default handler is already registered
- */
-dmod_dmip_api(1.0, int, _register_default_protocol_ex, ( dmip_protocol_handler_t handler, const char* module_name ));
-
-/**
- * @brief Register a fallback handler, as this module
- *
- * Wrapper over dmip_register_default_protocol_ex() that names the caller.
- */
-#define dmip_register_default_protocol(handler)   dmip_register_default_protocol_ex((handler), DMOD_MODULE_NAME)
-
-/**
- * @brief Undo dmip_register_default_protocol() - safe to call when no
- *        default handler is registered (a no-op)
- */
-dmod_dmip_api(1.0, void, _unregister_default_protocol, ( void ));
-
-/**
- * @brief Callback invoked once per registered protocol by
+ * @brief Callback invoked once per claimed protocol number by
  *        dmip_for_each_protocol()
  *
- * @param protocol  A protocol/next-header number currently claimed via
- *                   dmip_register_protocol()
- * @param user_data Passed through from dmip_for_each_protocol() unchanged
+ * @param protocol    A real protocol/next-header number (never
+ *                     DMIP_PROTO_DEFAULT - see dmip_for_each_protocol())
+ *                     some loaded module's dmip_protocol_numbers()
+ *                     reported
+ * @param module_name Name of the module that reported `protocol`
+ * @param user_data   Passed through from dmip_for_each_protocol() unchanged
  */
-typedef void (*dmip_protocol_visitor_t)( uint8_t protocol, void* user_data );
+typedef void (*dmip_protocol_visitor_t)( uint8_t protocol, const char* module_name, void* user_data );
 
 /**
- * @brief Call `callback` once per protocol number currently claimed via
- *        dmip_register_protocol()
+ * @brief Call `callback` once per real protocol number currently claimed
+ *        by some loaded, enabled module's dmip_protocol_numbers()
  *
- * Does not include the registered default handler (dmip_register_default_
- * protocol()), which has no protocol number of its own - see
- * dmip_register_default_protocol()'s own doc comment. The order entries are
- * visited in is unspecified (registration order in the current
- * implementation, but not a guaranteed contract). Safe to call with none
- * registered (`callback` is simply never invoked).
+ * Discovers implementors the same way dispatch_packet() does (see
+ * dmip_protocol_receive()'s own doc comment for what that means for a
+ * crashed/unloaded module - it simply stops appearing here too).
+ * DMIP_PROTO_DEFAULT is never passed to `callback` - it isn't a protocol
+ * number, just a fallback marker (see dmip_protocol_numbers()). Nothing
+ * here prevents two modules from claiming the same protocol number (see
+ * dispatch_packet()'s own doc comment for what dmip does about it) -
+ * `callback` is invoked once per (module, protocol) pair, so such a
+ * protocol is reported once per claimant, each time with the claimant's
+ * own module name. The order modules/protocols are visited in is
+ * unspecified.
  *
- * `callback` is invoked while the protocol dispatch table's mutex is held -
- * unlike dispatch_packet()'s handler invocation in src/dmip.c, which copies
- * the matched handler out first specifically so it can call back into
- * dmip_register_protocol()/_unregister_protocol() from its own dmod_init()/
- * _deinit(). A dmip_for_each_protocol() `callback` must not do that (or
- * call dmip_for_each_protocol() itself) - either would deadlock on the same
- * (non-recursive) mutex.
- *
- * @param callback  Invoked once per registered protocol number. Nothing
+ * @param callback  Invoked once per claimed protocol number. Nothing
  *                   happens if NULL
  * @param user_data Passed through to `callback` unchanged
  */
