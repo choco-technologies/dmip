@@ -715,7 +715,7 @@ static struct dmip_reassembly_entry* find_or_create_entry(dmip_family_t family, 
 
     entry->family = family;
     memcpy(entry->key, key, DMIP_REASSEMBLY_KEY_LEN);
-    entry->chunks = dmlist_create(DMOD_CURRENT_ALLOCATOR);
+    entry->chunks = dmlist_create();
     entry->total_length_known = false;
     entry->total_length = 0;
     entry->last_seen = dmosi_get_tick_count();
@@ -1405,10 +1405,10 @@ int dmod_init(const Dmod_Config_t *Config)
      * macro resolves to this module's own name here and to the running
      * process's allocator in an application module, so it stays correct if
      * this code is ever reused in one. */
-    g_reassembly = dmlist_create(DMOD_CURRENT_ALLOCATOR);
+    g_reassembly = dmlist_create();
     g_reassembly_mutex = dmosi_mutex_create(false);
     g_id_mutex = dmosi_mutex_create(false);
-    g_protocol_handlers = dmlist_create(DMOD_CURRENT_ALLOCATOR);
+    g_protocol_handlers = dmlist_create();
     g_protocol_mutex = dmosi_mutex_create(false);
     if (
         g_reassembly == NULL || g_reassembly_mutex == NULL || g_id_mutex == NULL
