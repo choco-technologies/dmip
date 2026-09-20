@@ -34,15 +34,17 @@
  *    checks the ethertype, strips the 14-byte L2 header, and feeds the
  *    rest through the existing dmip_v4_reassemble()/_v6_reassemble(). A
  *    completed packet is then dispatched by protocol number - see
- *    "Protocol dispatch" below - to whichever module registered for it
- *    (dmip_register_protocol()), a registered default handler, or
- *    dropped if nobody claimed it. There is no generic "give me the next
- *    packet" pull API anymore (dmip_v4_receive()/_v6_receive()/_receive()
- *    were removed): a single shared queue for every protocol meant two
- *    different protocol consumers polling it could steal each other's
- *    packets - see docs/dmip.md.
+ *    "Protocol dispatch" below - to whichever loaded module's
+ *    dmip_protocol_numbers() DIF implementation claims it (or the
+ *    DMIP_PROTO_DEFAULT fallback), or dropped if nobody claims it. There
+ *    is no generic "give me the next packet" pull API anymore
+ *    (dmip_v4_receive()/_v6_receive()/_receive() were removed): a single
+ *    shared queue for every protocol meant two different protocol
+ *    consumers polling it could steal each other's packets - see
+ *    docs/dmip.md.
  */
 #define DMOD_ENABLE_REGISTRATION    ON
+#define ENABLE_DIF_REGISTRATIONS    ON
 #include "dmod.h"
 #include "dmip.h"
 #include "dmnetbridge.h"
@@ -95,33 +97,12 @@ static uint16_t      g_v4_next_id = 0;
 static uint32_t      g_v6_next_id = 0;
 
 /**
- * @brief One registered protocol -> handler mapping (struct
- *        dmip_protocol_entry*) - see "Protocol dispatch" below
+ * @brief One (protocol -> module) dispatch cache entry (struct
+ *        dmip_dispatch_cache_entry*), guarded by g_dispatch_cache_mutex -
+ *        see dispatch_packet()'s "Protocol dispatch cache" doc comment
  */
-struct dmip_protocol_entry
-{
-    uint8_t                  protocol;
-    dmip_protocol_handler_t  handler;
-    char*                    module_name;  /**< Registrant, held resident while this entry lives */
-};
-
-/**
- * @brief Every currently registered dmip_protocol_entry*, guarded by
- *        g_protocol_mutex
- */
-static dmlist_context_t* g_protocol_handlers = NULL;
-static dmosi_mutex_t     g_protocol_mutex = NULL;
-
-/**
- * @brief The single registered default handler (dmip_register_default_protocol()),
- *        or NULL if none - guarded by g_protocol_mutex
- */
-static dmip_protocol_handler_t g_default_handler = NULL;
-
-/**
- * @brief Registrant of g_default_handler, held resident while it stands
- */
-static char* g_default_handler_module = NULL;
+static dmlist_context_t* g_dispatch_cache = NULL;
+static dmosi_mutex_t     g_dispatch_cache_mutex = NULL;
 
 /* ---- Checksum ---- */
 
@@ -1130,153 +1111,59 @@ dmod_dmip_api_declaration(1.0, int, _send, ( const dmip_header_t* header, const 
  * protocol check) a packet actually meant for some other protocol -
  * dmip looks at the packet's protocol number (IPv4's `protocol` field,
  * IPv6's `next_header` - the same numbering space, DMIP_PROTO_* in
- * dmip.h) and calls exactly the handler registered for it
- * (dmip_register_protocol()), falling back to the registered default
- * handler (dmip_register_default_protocol()) if none matches, or
- * dropping the packet if neither exists.
+ * dmip.h) and calls whichever loaded, enabled module's
+ * dmip_protocol_numbers() DIF implementation claims it, falling back to
+ * one that claims DMIP_PROTO_DEFAULT if none matches, or dropping the
+ * packet if neither exists - see dmip.h's "Protocol handler DIF" section
+ * for why this replaced a table dmip itself owned and modules registered
+ * into.
  * ========================================================================== */
 
 /**
- * @brief dmlist_compare_func_t matching a struct dmip_protocol_entry
- *        against a `const uint8_t*` protocol number needle
+ * @brief One (protocol -> module) dispatch cache entry - see
+ *        dispatch_packet()'s "Protocol dispatch cache" doc comment
  */
-static int compare_protocol(const void* data, const void* user_data)
+struct dmip_dispatch_cache_entry
 {
-    const struct dmip_protocol_entry* entry = (const struct dmip_protocol_entry*)data;
-    uint8_t protocol = *(const uint8_t*)user_data;
-    return (entry->protocol == protocol) ? 0 : -1;
-}
+    uint8_t          protocol;
+    Dmod_Context_t*  module;
+};
 
 /**
- * @brief Implementation of dmip_register_protocol() - see dmip.h
+ * @brief Ask `module`'s dmip_protocol_numbers() implementation whether it
+ *        claims `protocol`, and note whether it also claims the
+ *        DMIP_PROTO_DEFAULT fallback along the way
+ *
+ * @param module         A module context returned by Dmod_GetNextDifModule()
+ *                        for dmod_dmip_protocol_numbers_sig
+ * @param protocol       Real protocol/next-header number to look for
+ * @param out_is_default Set to true if `module` also claims
+ *                        DMIP_PROTO_DEFAULT - never cleared back to false,
+ *                        so callers can accumulate this across modules
+ *
+ * @return true if `module` claims `protocol` specifically
  */
-dmod_dmip_api_declaration(1.0, int, _register_protocol_ex, ( uint8_t protocol, dmip_protocol_handler_t handler, const char* module_name ))
+static bool module_claims_protocol(Dmod_Context_t* module, uint8_t protocol, bool* out_is_default)
 {
-    if (handler == NULL || module_name == NULL)
-        return -EINVAL;
+    dmod_dmip_protocol_numbers_t numbers_func =
+        (dmod_dmip_protocol_numbers_t)Dmod_GetDifFunction(module, dmod_dmip_protocol_numbers_sig);
+    if (numbers_func == NULL)
+        return false;
 
-    dmosi_mutex_lock(g_protocol_mutex);
+    uint16_t claimed[DMIP_MAX_PROTOCOL_NUMBERS];
+    size_t count = numbers_func(claimed, DMIP_MAX_PROTOCOL_NUMBERS);
+    if (count > DMIP_MAX_PROTOCOL_NUMBERS)
+        count = DMIP_MAX_PROTOCOL_NUMBERS;
 
-    int result;
-    if (dmlist_find(g_protocol_handlers, &protocol, compare_protocol) != NULL)
+    bool matches = false;
+    for (size_t i = 0; i < count; i++)
     {
-        result = -EEXIST;
+        if (claimed[i] == (uint16_t)protocol)
+            matches = true;
+        else if (claimed[i] == DMIP_PROTO_DEFAULT)
+            *out_is_default = true;
     }
-    else
-    {
-        struct dmip_protocol_entry* entry = Dmod_Malloc(sizeof(*entry));
-        if (entry == NULL)
-        {
-            result = -ENOMEM;
-        }
-        else
-        {
-            entry->protocol = protocol;
-            entry->handler = handler;
-            entry->module_name = Dmod_StrDup(module_name);
-
-            if (entry->module_name != NULL && dmlist_push_back(g_protocol_handlers, entry))
-            {
-                /* A registrant like dmicmp owns no thread and no process -
-                 * this reference is the only thing keeping it resident. */
-                Dmod_BeginUsage(entry->module_name);
-                result = 0;
-            }
-            else
-            {
-                Dmod_Free(entry->module_name);
-                Dmod_Free(entry);
-                result = -ENOMEM;
-            }
-        }
-    }
-
-    dmosi_mutex_unlock(g_protocol_mutex);
-    return result;
-}
-
-/**
- * @brief Implementation of dmip_unregister_protocol() - see dmip.h
- */
-dmod_dmip_api_declaration(1.0, void, _unregister_protocol, ( uint8_t protocol ))
-{
-    dmosi_mutex_lock(g_protocol_mutex);
-
-    struct dmip_protocol_entry* entry = (struct dmip_protocol_entry*)dmlist_find(g_protocol_handlers, &protocol, compare_protocol);
-    if (entry != NULL)
-    {
-        dmlist_remove(g_protocol_handlers, entry, compare_pointer);
-        Dmod_EndUsage(entry->module_name);
-        Dmod_Free(entry->module_name);
-        Dmod_Free(entry);
-    }
-
-    dmosi_mutex_unlock(g_protocol_mutex);
-}
-
-/**
- * @brief Implementation of dmip_register_default_protocol() - see dmip.h
- */
-dmod_dmip_api_declaration(1.0, int, _register_default_protocol_ex, ( dmip_protocol_handler_t handler, const char* module_name ))
-{
-    if (handler == NULL || module_name == NULL)
-        return -EINVAL;
-
-    dmosi_mutex_lock(g_protocol_mutex);
-
-    int result = (g_default_handler != NULL) ? -EEXIST : 0;
-    if (result == 0)
-    {
-        g_default_handler_module = Dmod_StrDup(module_name);
-        if (g_default_handler_module == NULL)
-        {
-            result = -ENOMEM;
-        }
-        else
-        {
-            g_default_handler = handler;
-            Dmod_BeginUsage(g_default_handler_module);
-        }
-    }
-
-    dmosi_mutex_unlock(g_protocol_mutex);
-    return result;
-}
-
-/**
- * @brief Implementation of dmip_unregister_default_protocol() - see dmip.h
- */
-dmod_dmip_api_declaration(1.0, void, _unregister_default_protocol, ( void ))
-{
-    dmosi_mutex_lock(g_protocol_mutex);
-
-    g_default_handler = NULL;
-    if (g_default_handler_module != NULL)
-    {
-        Dmod_EndUsage(g_default_handler_module);
-        Dmod_Free(g_default_handler_module);
-        g_default_handler_module = NULL;
-    }
-
-    dmosi_mutex_unlock(g_protocol_mutex);
-}
-
-/**
- * @brief dmlist_visit_func_t adapting a struct dmip_protocol_entry to the
- *        dmip_protocol_visitor_t callback dmip_for_each_protocol() got
- */
-typedef struct
-{
-    dmip_protocol_visitor_t callback;
-    void*                    user_data;
-} for_each_protocol_ctx_t;
-
-static bool for_each_protocol_visit(void* data, void* user_data)
-{
-    struct dmip_protocol_entry* entry = (struct dmip_protocol_entry*)data;
-    for_each_protocol_ctx_t* ctx = (for_each_protocol_ctx_t*)user_data;
-    ctx->callback(entry->protocol, ctx->user_data);
-    return true;
+    return matches;
 }
 
 /**
@@ -1287,32 +1174,178 @@ dmod_dmip_api_declaration(1.0, void, _for_each_protocol, ( dmip_protocol_visitor
     if (callback == NULL)
         return;
 
-    for_each_protocol_ctx_t ctx = { .callback = callback, .user_data = user_data };
+    Dmod_Context_t* module = Dmod_GetNextDifModule(dmod_dmip_protocol_numbers_sig, NULL);
+    while (module != NULL)
+    {
+        dmod_dmip_protocol_numbers_t numbers_func =
+            (dmod_dmip_protocol_numbers_t)Dmod_GetDifFunction(module, dmod_dmip_protocol_numbers_sig);
+        if (numbers_func != NULL)
+        {
+            uint16_t claimed[DMIP_MAX_PROTOCOL_NUMBERS];
+            size_t count = numbers_func(claimed, DMIP_MAX_PROTOCOL_NUMBERS);
+            if (count > DMIP_MAX_PROTOCOL_NUMBERS)
+                count = DMIP_MAX_PROTOCOL_NUMBERS;
 
-    dmosi_mutex_lock(g_protocol_mutex);
-    dmlist_foreach(g_protocol_handlers, for_each_protocol_visit, &ctx);
-    dmosi_mutex_unlock(g_protocol_mutex);
+            for (size_t i = 0; i < count; i++)
+            {
+                if (claimed[i] != DMIP_PROTO_DEFAULT)
+                    callback((uint8_t)claimed[i], Dmod_GetName(module), user_data);
+            }
+        }
+
+        module = Dmod_GetNextDifModule(dmod_dmip_protocol_numbers_sig, module);
+    }
 }
 
 /**
- * @brief Look up the registered (or default) handler for `protocol`,
- *        call it with `packet` if one exists, then free `packet`
+ * @brief dmlist_compare_func_t matching a struct dmip_dispatch_cache_entry
+ *        against a `const uint8_t*` protocol number needle
+ */
+static int compare_cache_protocol(const void* data, const void* user_data)
+{
+    const struct dmip_dispatch_cache_entry* entry = (const struct dmip_dispatch_cache_entry*)data;
+    uint8_t protocol = *(const uint8_t*)user_data;
+    return (entry->protocol == protocol) ? 0 : -1;
+}
+
+/**
+ * @brief Look up the cached module for `protocol`, if any - see
+ *        dispatch_packet()'s "Protocol dispatch cache" doc comment
+ */
+static Dmod_Context_t* cache_lookup(uint8_t protocol)
+{
+    dmosi_mutex_lock(g_dispatch_cache_mutex);
+    struct dmip_dispatch_cache_entry* entry =
+        (struct dmip_dispatch_cache_entry*)dmlist_find(g_dispatch_cache, &protocol, compare_cache_protocol);
+    Dmod_Context_t* module = (entry != NULL) ? entry->module : NULL;
+    dmosi_mutex_unlock(g_dispatch_cache_mutex);
+    return module;
+}
+
+/**
+ * @brief Record `module` as the cached handler for `protocol`, replacing
+ *        any existing entry - see dispatch_packet()'s "Protocol dispatch
+ *        cache" doc comment
  *
- * Copies the matched handler out from under g_protocol_mutex before
- * calling it, rather than holding the lock into another module's code -
- * a handler is free to call dmip_register_protocol()/_unregister_protocol()
- * itself (e.g. from its own dmod_init()/_deinit()) without deadlocking.
+ * Failure to allocate a new entry is not reported - the cache is a hint,
+ * not required for correctness, so a failed insert just means the next
+ * dispatch for `protocol` falls back to a full scan again instead of
+ * hitting the cache.
+ */
+static void cache_store(uint8_t protocol, Dmod_Context_t* module)
+{
+    dmosi_mutex_lock(g_dispatch_cache_mutex);
+
+    struct dmip_dispatch_cache_entry* entry =
+        (struct dmip_dispatch_cache_entry*)dmlist_find(g_dispatch_cache, &protocol, compare_cache_protocol);
+    if (entry != NULL)
+    {
+        entry->module = module;
+    }
+    else
+    {
+        entry = Dmod_Malloc(sizeof(*entry));
+        if (entry != NULL)
+        {
+            entry->protocol = protocol;
+            entry->module = module;
+            if (!dmlist_push_back(g_dispatch_cache, entry))
+                Dmod_Free(entry);
+        }
+    }
+
+    dmosi_mutex_unlock(g_dispatch_cache_mutex);
+}
+
+/**
+ * @brief Find the handler for `protocol` among every loaded, enabled
+ *        dmip_protocol_numbers() implementor, call it with `packet` if
+ *        one exists, then free `packet`
+ *
+ * Scans every implementor once before picking a handler, rather than
+ * calling into the first DMIP_PROTO_DEFAULT claimant found before a
+ * later implementor turns out to claim `protocol` specifically - an
+ * exact claim always wins over a fallback one, regardless of discovery
+ * order. If more than one module claims the exact same protocol (nothing
+ * prevents that - see dmip_protocol_numbers()'s own doc comment),
+ * whichever is discovered first wins; same for more than one fallback
+ * claimant.
+ *
+ * ---- Protocol dispatch cache ----
+ *
+ * A full scan costs one dmip_protocol_numbers() call per loaded DIF
+ * implementor - fine for the handful of protocol handlers this tree has
+ * today, but wasteful to repeat for every single packet of an
+ * already-known protocol (the overwhelmingly common case: a given
+ * interface's traffic is mostly the same few protocols over and over).
+ * g_dispatch_cache remembers, per exact protocol number, which module
+ * answered last time - a hint, never authoritative state: every cache hit
+ * is re-verified against that module's own current dmip_protocol_numbers()
+ * before being trusted (module_claims_protocol(), the same check a fresh
+ * scan would make), so a crashed/unloaded/reloaded module - or one that
+ * simply changed its mind about what it claims - is never called on stale
+ * information; it just costs one wasted lookup, falling through to a full
+ * scan exactly as if nothing had been cached. Only exact matches are
+ * cached, never the DMIP_PROTO_DEFAULT fallback: caching that would mean
+ * a newly-loaded module claiming a specific protocol already served by
+ * the cached default claimant could never be discovered again, since
+ * every future packet for that protocol would keep hitting the (still
+ * validly-answering, just no longer exclusively correct) cached default
+ * entry instead of ever re-scanning - unlike an exact-match cache entry
+ * going stale, that failure mode has no self-correcting trigger. A
+ * default-routed or first-seen-protocol packet therefore always pays for
+ * a full scan, same as before this cache existed.
  */
 static void dispatch_packet(uint8_t protocol, dmip_family_t family, dmnetif_iface_t iface, uint8_t* packet, size_t length)
 {
-    dmosi_mutex_lock(g_protocol_mutex);
-    struct dmip_protocol_entry* entry = (struct dmip_protocol_entry*)dmlist_find(g_protocol_handlers, &protocol, compare_protocol);
-    dmip_protocol_handler_t handler = (entry != NULL) ? entry->handler : g_default_handler;
-    dmosi_mutex_unlock(g_protocol_mutex);
-
-    if (handler != NULL)
+    Dmod_Context_t* cached = cache_lookup(protocol);
+    if (cached != NULL)
     {
-        handler(family, iface, packet, length);
+        bool ignored_is_default = false;
+        if (module_claims_protocol(cached, protocol, &ignored_is_default))
+        {
+            dmod_dmip_protocol_receive_t handler =
+                (dmod_dmip_protocol_receive_t)Dmod_GetDifFunction(cached, dmod_dmip_protocol_receive_sig);
+            if (handler != NULL)
+            {
+                handler(family, iface, packet, length);
+                Dmod_Free(packet);
+                return;
+            }
+        }
+        /* Stale hint (module gone, or no longer claims `protocol`) - fall
+         * through to a full scan below, which will overwrite or leave
+         * this entry alone depending on what it finds. */
+    }
+
+    Dmod_Context_t* default_module = NULL;
+    Dmod_Context_t* module = Dmod_GetNextDifModule(dmod_dmip_protocol_numbers_sig, NULL);
+
+    while (module != NULL)
+    {
+        bool is_default = false;
+        if (module_claims_protocol(module, protocol, &is_default))
+        {
+            dmod_dmip_protocol_receive_t handler =
+                (dmod_dmip_protocol_receive_t)Dmod_GetDifFunction(module, dmod_dmip_protocol_receive_sig);
+            if (handler != NULL)
+                handler(family, iface, packet, length);
+            cache_store(protocol, module);
+            Dmod_Free(packet);
+            return;
+        }
+        if (is_default && default_module == NULL)
+            default_module = module;
+
+        module = Dmod_GetNextDifModule(dmod_dmip_protocol_numbers_sig, module);
+    }
+
+    if (default_module != NULL)
+    {
+        dmod_dmip_protocol_receive_t handler =
+            (dmod_dmip_protocol_receive_t)Dmod_GetDifFunction(default_module, dmod_dmip_protocol_receive_sig);
+        if (handler != NULL)
+            handler(family, iface, packet, length);
     }
 
     Dmod_Free(packet);
@@ -1390,7 +1423,14 @@ dmod_dmnetbridge_dif_api_declaration(1.0, dmip, void, _packet_received, ( dmneti
 
 /**
  * @brief Module initialization - allocates the reassembly table, the
- *        protocol dispatch table, and their guarding mutexes
+ *        protocol dispatch cache, and their guarding mutexes
+ *
+ * No protocol dispatch *registration* table to allocate anymore -
+ * dispatch_packet()/_for_each_protocol() discover protocol handlers fresh
+ * via DIF instead of owning a table modules register into (see dmip.h's
+ * "Protocol handler DIF" section). g_dispatch_cache is different: it's a
+ * hint, not authoritative state - see dispatch_packet()'s "Protocol
+ * dispatch cache" doc comment for why that distinction matters.
  */
 int dmod_init(const Dmod_Config_t *Config)
 {
@@ -1408,11 +1448,11 @@ int dmod_init(const Dmod_Config_t *Config)
     g_reassembly = dmlist_create();
     g_reassembly_mutex = dmosi_mutex_create(false);
     g_id_mutex = dmosi_mutex_create(false);
-    g_protocol_handlers = dmlist_create();
-    g_protocol_mutex = dmosi_mutex_create(false);
+    g_dispatch_cache = dmlist_create();
+    g_dispatch_cache_mutex = dmosi_mutex_create(false);
     if (
         g_reassembly == NULL || g_reassembly_mutex == NULL || g_id_mutex == NULL
-     || g_protocol_handlers == NULL || g_protocol_mutex == NULL
+     || g_dispatch_cache == NULL || g_dispatch_cache_mutex == NULL
         )
     {
         DMOD_LOG_ERROR("Failed to allocate dmip state\n");
@@ -1421,7 +1461,6 @@ int dmod_init(const Dmod_Config_t *Config)
 
     g_v4_next_id = 0;
     g_v6_next_id = 0;
-    g_default_handler = NULL;
 
     DMOD_LOG_INFO("DMIP initialized\n");
     return 0;
@@ -1429,7 +1468,7 @@ int dmod_init(const Dmod_Config_t *Config)
 
 /**
  * @brief Module deinitialization - frees every in-progress reassembly and
- *        every protocol registration, then the tables and mutexes
+ *        every cached dispatch entry, then the tables and mutexes
  */
 int dmod_deinit(void)
 {
@@ -1446,17 +1485,16 @@ int dmod_deinit(void)
     dmosi_mutex_destroy(g_id_mutex);
     g_id_mutex = NULL;
 
-    size_t protocol_count = dmlist_size(g_protocol_handlers);
-    for (size_t i = 0; i < protocol_count; i++)
+    size_t cache_count = dmlist_size(g_dispatch_cache);
+    for (size_t i = 0; i < cache_count; i++)
     {
-        Dmod_Free(dmlist_pop_front(g_protocol_handlers));
+        Dmod_Free(dmlist_pop_front(g_dispatch_cache));
     }
-    dmlist_destroy(g_protocol_handlers);
-    g_protocol_handlers = NULL;
+    dmlist_destroy(g_dispatch_cache);
+    g_dispatch_cache = NULL;
 
-    dmosi_mutex_destroy(g_protocol_mutex);
-    g_protocol_mutex = NULL;
-    g_default_handler = NULL;
+    dmosi_mutex_destroy(g_dispatch_cache_mutex);
+    g_dispatch_cache_mutex = NULL;
 
     DMOD_LOG_INFO("DMIP deinitialized\n");
     return 0;

@@ -1,7 +1,8 @@
 /**
  * @file lsproto.c
- * @brief lsproto - lists every IP protocol number currently registered
- *        with dmip via dmip_register_protocol()
+ * @brief lsproto - lists every IP protocol number some loaded module
+ *        currently claims via dmip's protocol handler DIF (see dmip.h's
+ *        "Protocol handler DIF" section)
  */
 #include "dmod.h"
 #include "dmip.h"
@@ -26,10 +27,10 @@ static const char* protocol_name(uint8_t protocol)
     }
 }
 
-static void print_protocol(uint8_t protocol, void* user_data)
+static void print_protocol(uint8_t protocol, const char* module_name, void* user_data)
 {
     size_t* count = (size_t*)user_data;
-    Dmod_Printf("  %3u  %s\n", (unsigned)protocol, protocol_name(protocol));
+    Dmod_Printf("  %3u  %-14s %s\n", (unsigned)protocol, protocol_name(protocol), module_name);
     (*count)++;
 }
 
