@@ -34,24 +34,28 @@
  * dmod_dmnetbridge_packet_received_sig) and linking dmnetbridge_if.
  *
  * Protocol dispatch is exercised the same way real protocol modules
- * (dmicmp/dmtcp/dmudp) do it now: this test binary (test_dmip, itself a
- * real loaded module) implements dmip's protocol handler DIF
- * (dmip_protocol_receive()/_protocol_numbers() - see "Protocol handler
- * DIF fixture" below), backed by a plain mutable global the test steps
- * set directly instead of calling a register/unregister API (there is no
- * such API anymore - see dmip.h's "Protocol handler DIF" section). This
- * requires DMOD_ENABLE_REGISTRATION so the DIF implementations below are
- * real (not extern) entries in this module's own .dmod.inputs section.
+ * (dmicmp/dmtcp/dmudp) do it now: a module implements dmip's protocol
+ * handler DIF (dmip_protocol_receive()/_protocol_numbers()) instead of
+ * calling a register/unregister API (there is no such API anymore - see
+ * dmip.h's "Protocol handler DIF" section). This test binary itself can't
+ * play that role - it's an Application-type module (dmod_add_test()), and
+ * Dmod_GetNextDifModule() only ever returns *enabled* modules, a state
+ * only a Library-type module can reach (see dmod's own Dmod_Enable()/
+ * Dmod_Run()). Instead, dmip_test_fixture (a small Library-type module in
+ * fixtures/dmip_test_fixture/, linked below) implements the DIF; the
+ * "Protocol dispatch" steps drive it through its own Built-in API
+ * (dmip_test_fixture_claim()/_get_last_call()/...) instead of touching
+ * global state directly.
  *
  * Every send/receive step uses a distinct destination network (never
  * reused across steps), since dmroute's routes and dmarp's cache are
  * both global state that outlives a single test step - same discipline
  * dmarp_test.c documents for its own cache entries.
  */
-#define DMOD_ENABLE_REGISTRATION ON
 #define ENABLE_DIF_REGISTRATIONS ON
 #include "dmod_test.h"
 #include "dmip.h"
+#include "dmip_test_fixture.h"
 #include "dmroute.h"
 #include "dmnetif.h"
 #include "dmarp.h"
@@ -121,54 +125,24 @@ static void collect_fragment(const uint8_t* fragment, size_t fragment_len, void*
 static dmnetif_iface_t g_iface0 = NULL;
 static dmnetif_iface_t g_iface1 = NULL;
 
-/* ---- Protocol handler DIF fixture state ----
- *
- * This test binary (test_dmip) is itself a real loaded module, so it can
- * implement dmip's protocol handler DIF directly, the same way
- * dmicmp/dmtcp/dmudp do (see dmip.h's "Protocol handler DIF" section) -
- * the actual dmip_protocol_receive()/_protocol_numbers() implementations
- * live further down, next to the "Protocol dispatch" tests that use them.
- * g_claimed_protocols/g_claimed_count stand in for what a real
- * implementation would compute from its own state; test steps set them
- * via claim_protocols()/_one_protocol()/_nothing() below instead of
- * calling a register/unregister API (there is no such API anymore).
- * dmod_test_setup()/_teardown() reset the claim to empty before/after
- * every step, mirroring the discipline this file already applies to
- * g_iface0/g_iface1.
- */
-static uint16_t g_claimed_protocols[DMIP_MAX_PROTOCOL_NUMBERS];
-static size_t   g_claimed_count = 0;
-
-static void claim_protocols(const uint16_t* protocols, size_t count)
-{
-    if (count > DMIP_MAX_PROTOCOL_NUMBERS)
-        count = DMIP_MAX_PROTOCOL_NUMBERS;
-    memcpy(g_claimed_protocols, protocols, count * sizeof(uint16_t));
-    g_claimed_count = count;
-}
-
-static void claim_one_protocol(uint16_t protocol)
-{
-    claim_protocols(&protocol, 1);
-}
-
-static void claim_nothing(void)
-{
-    g_claimed_count = 0;
-}
+/* dmip_test_fixture_claim_nothing()/_reset_call_record() reset the DIF
+ * fixture's state before/after every step, mirroring the discipline this
+ * file already applies to g_iface0/g_iface1 - see dmip_test_fixture.h. */
 
 void dmod_test_setup(void)
 {
     g_iface0 = dmnetif_register("test0", TEST_DEVICE_PATH_0);
     g_iface1 = dmnetif_register("test1", TEST_DEVICE_PATH_1);
-    claim_nothing();
+    dmip_test_fixture_claim_nothing();
+    dmip_test_fixture_reset_call_record();
 }
 
 void dmod_test_teardown(void)
 {
     dmnetif_unregister(g_iface0);
     dmnetif_unregister(g_iface1);
-    claim_nothing();
+    dmip_test_fixture_claim_nothing();
+    dmip_test_fixture_reset_call_record();
     g_iface0 = NULL;
     g_iface1 = NULL;
 }
@@ -1003,16 +977,18 @@ static size_t build_v6_packet(uint8_t* buffer, size_t buffer_len, uint8_t next_h
  * protocol (see dmip.md's "Protocol dispatch" section for the bug this
  * replaced, and for why the mechanism that replaced the original
  * register/unregister table is DIF-based discovery instead). Every step
- * below calls claim_protocols()/_one_protocol()/_nothing() (see the
- * "Protocol handler DIF fixture state" section above) before feeding a
- * packet - dmod_test_setup()/_teardown() reset the claim to empty around
- * every step, so nothing here needs to explicitly clear it afterward.
+ * below calls dmip_test_fixture_claim()/_claim_one()/_claim_nothing()
+ * before feeding a packet, then dmip_test_fixture_get_last_call() to see
+ * what (if anything) the fixture's dmip_protocol_receive() implementation
+ * was called with - dmod_test_setup()/_teardown() reset both the claim
+ * and the call record around every step, so nothing here needs to
+ * explicitly clear either afterward.
  *
  * A genuine two-module race between a specific claimant and a separate
- * default-only claimant isn't exercised here: this test binary is itself
- * exactly one loaded module, so it can only ever appear once to
- * Dmod_GetNextDifModule() - see dispatch_packet()'s own doc comment in
- * dmip.c for the tie-break rule that governs a real such race.
+ * default-only claimant isn't exercised here: only one fixture module is
+ * loaded, so it can only ever appear once to Dmod_GetNextDifModule() -
+ * see dispatch_packet()'s own doc comment in dmip.c for the tie-break
+ * rule that governs a real such race.
  */
 
 typedef struct
@@ -1020,46 +996,20 @@ typedef struct
     bool            called;
     dmip_family_t   family;
     dmnetif_iface_t iface;
-    uint8_t         packet[128];
+    uint8_t         packet[DMIP_TEST_FIXTURE_MAX_PACKET_LEN];
     size_t          packet_len;
-} handler_call_t;
+} recorded_call_t;
 
-static handler_call_t g_last_call;
-
-static void record_call(dmip_family_t family, dmnetif_iface_t iface, const uint8_t* packet, size_t packet_len)
+static recorded_call_t fetch_last_call(void)
 {
-    g_last_call.called = true;
-    g_last_call.family = family;
-    g_last_call.iface = iface;
-    g_last_call.packet_len = packet_len;
-    memcpy(g_last_call.packet, packet, packet_len);
-}
-
-/**
- * @brief Implementation of dmip's dmip_protocol_receive DIF (see dmip.h)
- *        for this test binary - forwards to record_call()
- */
-dmod_dmip_dif_api_declaration(1.0, test_dmip, void, _protocol_receive, ( dmip_family_t family, dmnetif_iface_t iface, const uint8_t* packet, size_t packet_len ))
-{
-    record_call(family, iface, packet, packet_len);
-}
-
-/**
- * @brief Implementation of dmip's dmip_protocol_numbers DIF (see dmip.h)
- *        for this test binary - reports whatever
- *        claim_protocols()/_one_protocol()/_nothing() last set
- */
-dmod_dmip_dif_api_declaration(1.0, test_dmip, size_t, _protocol_numbers, ( uint16_t* out_protocols, size_t max_protocols ))
-{
-    size_t count = (g_claimed_count < max_protocols) ? g_claimed_count : max_protocols;
-    memcpy(out_protocols, g_claimed_protocols, count * sizeof(uint16_t));
-    return count;
+    recorded_call_t call = { 0 };
+    call.called = dmip_test_fixture_get_last_call(&call.family, &call.iface, call.packet, &call.packet_len);
+    return call;
 }
 
 DMOD_TEST_STEP(claimed_protocol_delivers_matching_v4_packet)
 {
-    memset(&g_last_call, 0, sizeof(g_last_call));
-    claim_one_protocol(TEST_PROTOCOL_A);
+    dmip_test_fixture_claim_one(TEST_PROTOCOL_A);
 
     uint8_t payload[4] = { 11, 22, 33, 44 };
     uint8_t packet[DMIP_V4_HEADER_LEN + sizeof(payload)];
@@ -1069,11 +1019,12 @@ DMOD_TEST_STEP(claimed_protocol_delivers_matching_v4_packet)
 
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet, packet_len);
 
-    DMOD_TEST_EXPECT_TRUE(g_last_call.called);
-    DMOD_TEST_EXPECT_EQ(g_last_call.family, dmip_family_v4);
-    DMOD_TEST_EXPECT_EQ(g_last_call.iface, g_iface0);
-    DMOD_TEST_EXPECT_EQ(g_last_call.packet_len, packet_len);
-    DMOD_TEST_EXPECT_TRUE(bytes_equal(g_last_call.packet, packet, packet_len));
+    recorded_call_t call = fetch_last_call();
+    DMOD_TEST_EXPECT_TRUE(call.called);
+    DMOD_TEST_EXPECT_EQ(call.family, dmip_family_v4);
+    DMOD_TEST_EXPECT_EQ(call.iface, g_iface0);
+    DMOD_TEST_EXPECT_EQ(call.packet_len, packet_len);
+    DMOD_TEST_EXPECT_TRUE(bytes_equal(call.packet, packet, packet_len));
 }
 
 DMOD_TEST_STEP(claimed_protocol_delivers_matching_v6_packet)
@@ -1081,8 +1032,7 @@ DMOD_TEST_STEP(claimed_protocol_delivers_matching_v6_packet)
     /* Same protocol number, the other family - proves DMIP_PROTO_* is one
      * shared numbering space, not per-family (IPv4's protocol field and
      * IPv6's next_header both feed the same dispatch). */
-    memset(&g_last_call, 0, sizeof(g_last_call));
-    claim_one_protocol(TEST_PROTOCOL_A);
+    dmip_test_fixture_claim_one(TEST_PROTOCOL_A);
 
     uint8_t payload[3] = { 7, 8, 9 };
     uint8_t packet[DMIP_V6_HEADER_LEN + sizeof(payload)];
@@ -1090,11 +1040,12 @@ DMOD_TEST_STEP(claimed_protocol_delivers_matching_v6_packet)
 
     feed_packet(g_iface1, TEST_ETHERTYPE_IPV6, packet, packet_len);
 
-    DMOD_TEST_EXPECT_TRUE(g_last_call.called);
-    DMOD_TEST_EXPECT_EQ(g_last_call.family, dmip_family_v6);
-    DMOD_TEST_EXPECT_EQ(g_last_call.iface, g_iface1);
-    DMOD_TEST_EXPECT_EQ(g_last_call.packet_len, packet_len);
-    DMOD_TEST_EXPECT_TRUE(bytes_equal(g_last_call.packet, packet, packet_len));
+    recorded_call_t call = fetch_last_call();
+    DMOD_TEST_EXPECT_TRUE(call.called);
+    DMOD_TEST_EXPECT_EQ(call.family, dmip_family_v6);
+    DMOD_TEST_EXPECT_EQ(call.iface, g_iface1);
+    DMOD_TEST_EXPECT_EQ(call.packet_len, packet_len);
+    DMOD_TEST_EXPECT_TRUE(bytes_equal(call.packet, packet, packet_len));
 }
 
 DMOD_TEST_STEP(claimed_protocol_ignores_non_matching_packet)
@@ -1103,8 +1054,7 @@ DMOD_TEST_STEP(claimed_protocol_ignores_non_matching_packet)
      * list, no default) must not reach a handler for a different claimed
      * protocol (TEST_PROTOCOL_A) - the exact cross-protocol stealing bug
      * this whole mechanism replaced (see dmip.md). */
-    memset(&g_last_call, 0, sizeof(g_last_call));
-    claim_one_protocol(TEST_PROTOCOL_A);
+    dmip_test_fixture_claim_one(TEST_PROTOCOL_A);
 
     uint8_t payload[2] = { 1, 2 };
     uint8_t packet[DMIP_V4_HEADER_LEN + sizeof(payload)];
@@ -1112,7 +1062,7 @@ DMOD_TEST_STEP(claimed_protocol_ignores_non_matching_packet)
 
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet, packet_len);
 
-    DMOD_TEST_EXPECT_FALSE(g_last_call.called);
+    DMOD_TEST_EXPECT_FALSE(fetch_last_call().called);
 }
 
 DMOD_TEST_STEP(claiming_multiple_protocols_at_once_delivers_both)
@@ -1122,29 +1072,27 @@ DMOD_TEST_STEP(claiming_multiple_protocols_at_once_delivers_both)
      * example - ICMP, ICMPv6, and DMIP_PROTO_DEFAULT all at once) -
      * nothing here requires one protocol per module. */
     uint16_t claimed[] = { TEST_PROTOCOL_A, TEST_PROTOCOL_B };
-    claim_protocols(claimed, 2);
+    dmip_test_fixture_claim(claimed, 2);
 
     uint8_t payload[2] = { 20, 21 };
     uint8_t packet_a[DMIP_V4_HEADER_LEN + sizeof(payload)];
     size_t packet_a_len = build_v4_packet(packet_a, sizeof(packet_a), TEST_PROTOCOL_A, make_v4(10, 3, 6, 1), make_v4(10, 3, 6, 2), payload, sizeof(payload));
 
-    memset(&g_last_call, 0, sizeof(g_last_call));
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet_a, packet_a_len);
-    DMOD_TEST_EXPECT_TRUE(g_last_call.called);
+    DMOD_TEST_EXPECT_TRUE(fetch_last_call().called);
 
+    dmip_test_fixture_reset_call_record();
     uint8_t packet_b[DMIP_V4_HEADER_LEN + sizeof(payload)];
     size_t packet_b_len = build_v4_packet(packet_b, sizeof(packet_b), TEST_PROTOCOL_B, make_v4(10, 3, 6, 3), make_v4(10, 3, 6, 4), payload, sizeof(payload));
 
-    memset(&g_last_call, 0, sizeof(g_last_call));
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet_b, packet_b_len);
-    DMOD_TEST_EXPECT_TRUE(g_last_call.called);
+    DMOD_TEST_EXPECT_TRUE(fetch_last_call().called);
 }
 
 DMOD_TEST_STEP(clearing_the_claim_stops_delivery)
 {
-    memset(&g_last_call, 0, sizeof(g_last_call));
-    claim_one_protocol(TEST_PROTOCOL_A);
-    claim_nothing();
+    dmip_test_fixture_claim_one(TEST_PROTOCOL_A);
+    dmip_test_fixture_claim_nothing();
 
     uint8_t payload[2] = { 3, 4 };
     uint8_t packet[DMIP_V4_HEADER_LEN + sizeof(payload)];
@@ -1152,13 +1100,12 @@ DMOD_TEST_STEP(clearing_the_claim_stops_delivery)
 
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet, packet_len);
 
-    DMOD_TEST_EXPECT_FALSE(g_last_call.called);
+    DMOD_TEST_EXPECT_FALSE(fetch_last_call().called);
 }
 
 DMOD_TEST_STEP(default_claim_receives_unclaimed_packet)
 {
-    memset(&g_last_call, 0, sizeof(g_last_call));
-    claim_one_protocol(DMIP_PROTO_DEFAULT);
+    dmip_test_fixture_claim_one(DMIP_PROTO_DEFAULT);
 
     uint8_t payload[2] = { 5, 6 };
     uint8_t packet[DMIP_V4_HEADER_LEN + sizeof(payload)];
@@ -1166,8 +1113,9 @@ DMOD_TEST_STEP(default_claim_receives_unclaimed_packet)
 
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet, packet_len);
 
-    DMOD_TEST_EXPECT_TRUE(g_last_call.called);
-    DMOD_TEST_EXPECT_EQ(g_last_call.packet_len, packet_len);
+    recorded_call_t call = fetch_last_call();
+    DMOD_TEST_EXPECT_TRUE(call.called);
+    DMOD_TEST_EXPECT_EQ(call.packet_len, packet_len);
 }
 
 DMOD_TEST_STEP(default_claim_does_not_shadow_an_exact_claim_from_the_same_module)
@@ -1176,9 +1124,8 @@ DMOD_TEST_STEP(default_claim_does_not_shadow_an_exact_claim_from_the_same_module
      * change delivery for a packet matching that specific number - the
      * exact match is found regardless of where DMIP_PROTO_DEFAULT sits in
      * the claimed list. */
-    memset(&g_last_call, 0, sizeof(g_last_call));
     uint16_t claimed[] = { TEST_PROTOCOL_A, DMIP_PROTO_DEFAULT };
-    claim_protocols(claimed, 2);
+    dmip_test_fixture_claim(claimed, 2);
 
     uint8_t payload[2] = { 7, 8 };
     uint8_t packet[DMIP_V4_HEADER_LEN + sizeof(payload)];
@@ -1186,13 +1133,12 @@ DMOD_TEST_STEP(default_claim_does_not_shadow_an_exact_claim_from_the_same_module
 
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet, packet_len);
 
-    DMOD_TEST_EXPECT_TRUE(g_last_call.called);
+    DMOD_TEST_EXPECT_TRUE(fetch_last_call().called);
 }
 
 DMOD_TEST_STEP(no_claim_at_all_drops_the_packet_safely)
 {
-    memset(&g_last_call, 0, sizeof(g_last_call));
-    claim_nothing();
+    dmip_test_fixture_claim_nothing();
 
     uint8_t payload[2] = { 9, 10 };
     uint8_t packet[DMIP_V4_HEADER_LEN + sizeof(payload)];
@@ -1202,7 +1148,7 @@ DMOD_TEST_STEP(no_claim_at_all_drops_the_packet_safely)
      * (no crash), not just "not call our handler". */
     feed_packet(g_iface0, TEST_ETHERTYPE_IPV4, packet, packet_len);
 
-    DMOD_TEST_EXPECT_FALSE(g_last_call.called);
+    DMOD_TEST_EXPECT_FALSE(fetch_last_call().called);
 }
 
 typedef struct
@@ -1231,7 +1177,7 @@ static bool for_each_protocol_result_contains(const for_each_protocol_result_t* 
 DMOD_TEST_STEP(for_each_protocol_reports_every_claimed_number)
 {
     uint16_t claimed[] = { TEST_PROTOCOL_A, TEST_PROTOCOL_B };
-    claim_protocols(claimed, 2);
+    dmip_test_fixture_claim(claimed, 2);
 
     for_each_protocol_result_t result = { .count = 0 };
     dmip_for_each_protocol(collect_protocol, &result);
@@ -1245,7 +1191,7 @@ DMOD_TEST_STEP(for_each_protocol_excludes_unclaimed_and_default)
 {
     /* DMIP_PROTO_DEFAULT claims no protocol number of its own - it must
      * never show up in the enumeration. */
-    claim_one_protocol(DMIP_PROTO_DEFAULT);
+    dmip_test_fixture_claim_one(DMIP_PROTO_DEFAULT);
 
     for_each_protocol_result_t result = { .count = 0 };
     dmip_for_each_protocol(collect_protocol, &result);
@@ -1255,7 +1201,7 @@ DMOD_TEST_STEP(for_each_protocol_excludes_unclaimed_and_default)
 
 DMOD_TEST_STEP(for_each_protocol_with_null_callback_is_safe)
 {
-    claim_one_protocol(TEST_PROTOCOL_A);
+    dmip_test_fixture_claim_one(TEST_PROTOCOL_A);
 
     dmip_for_each_protocol(NULL, NULL);
 }
