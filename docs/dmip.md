@@ -191,12 +191,25 @@ dispatcher one level up (by Ethertype, via the `packet_received` DIF); this
 is the same idea one level further in, just discovered instead of
 registered.
 
-The accepted tradeoff: dispatching a packet now costs a scan over every
-loaded module implementing `dmip_protocol_numbers()` instead of one table
-lookup. Nothing in this tree implements more than a handful of protocol
-handlers today, so this is not a concern in practice - if it ever becomes
-one, the discovery results can be cached without changing this DIF-based
-design.
+A full scan over every loaded module implementing `dmip_protocol_numbers()`
+is only actually paid on the first packet of a given protocol (or the
+first after that module goes away, or for a `DMIP_PROTO_DEFAULT`-routed
+packet, which never uses the cache - see below): `dispatch_packet()` keeps
+a small cache (`g_dispatch_cache`, a `dmlist` guarded by a mutex, same
+shape as the reassembly table) mapping an exact protocol number to the
+module that last answered for it. A cache hit is always re-verified
+against that module's own current `dmip_protocol_numbers()`
+(`module_claims_protocol()`) before being trusted - the cache is a hint,
+never authoritative state, so a crashed, unloaded, reloaded, or simply
+changed-its-mind module costs one wasted lookup (falling through to a
+full scan, exactly as if nothing had been cached) rather than a stale
+call. Only exact matches are ever cached, never the default fallback:
+caching that would mean a newly-loaded module claiming a specific
+protocol the cached default claimant used to catch could never be
+discovered again, since every future packet for that protocol would keep
+hitting the (still validly-answering, just no longer exclusively correct)
+cached default entry - unlike an exact-match entry going stale, that
+failure mode has no self-correcting trigger, so it isn't cached at all.
 
 An implementation receives a **borrowed** `packet` pointer, valid only for
 the duration of the call (same contract `dmnetbridge.h`'s `packet_received`

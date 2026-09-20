@@ -135,10 +135,15 @@ typedef dmroute_addr_t dmip_addr_t;
  * dmip.c) rather than storing anything - a module that crashes, is
  * disabled, or is unloaded simply stops being discovered, with nothing
  * left over to call by accident and nothing keeping it loaded against its
- * own lifecycle. The tradeoff: dispatching a packet now costs a scan over
- * every loaded module implementing this DIF instead of one table lookup -
- * accepted for how few protocol handlers exist in this tree today, with
- * room to optimize later (e.g. caching discovery results) if that changes.
+ * own lifecycle. A full scan over every loaded module implementing this
+ * DIF is therefore only actually paid on the first packet of a given
+ * protocol (or the first after that module goes away) - dispatch_packet()
+ * caches, per exact protocol number, which module answered last time, and
+ * re-verifies that hint against the module's own current
+ * dmip_protocol_numbers() before trusting it, so a crashed/unloaded/
+ * reloaded module never gets called on stale information (see
+ * dispatch_packet()'s own "Protocol dispatch cache" doc comment in
+ * dmip.c).
  *
  * Called on whatever thread is pumping the interface the packet arrived
  * on - usually not the same thread that will eventually want the data, so

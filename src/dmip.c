@@ -96,6 +96,14 @@ static dmosi_mutex_t g_id_mutex = NULL;
 static uint16_t      g_v4_next_id = 0;
 static uint32_t      g_v6_next_id = 0;
 
+/**
+ * @brief One (protocol -> module) dispatch cache entry (struct
+ *        dmip_dispatch_cache_entry*), guarded by g_dispatch_cache_mutex -
+ *        see dispatch_packet()'s "Protocol dispatch cache" doc comment
+ */
+static dmlist_context_t* g_dispatch_cache = NULL;
+static dmosi_mutex_t     g_dispatch_cache_mutex = NULL;
+
 /* ---- Checksum ---- */
 
 /**
@@ -1112,6 +1120,16 @@ dmod_dmip_api_declaration(1.0, int, _send, ( const dmip_header_t* header, const 
  * ========================================================================== */
 
 /**
+ * @brief One (protocol -> module) dispatch cache entry - see
+ *        dispatch_packet()'s "Protocol dispatch cache" doc comment
+ */
+struct dmip_dispatch_cache_entry
+{
+    uint8_t          protocol;
+    Dmod_Context_t*  module;
+};
+
+/**
  * @brief Ask `module`'s dmip_protocol_numbers() implementation whether it
  *        claims `protocol`, and note whether it also claims the
  *        DMIP_PROTO_DEFAULT fallback along the way
@@ -1180,6 +1198,66 @@ dmod_dmip_api_declaration(1.0, void, _for_each_protocol, ( dmip_protocol_visitor
 }
 
 /**
+ * @brief dmlist_compare_func_t matching a struct dmip_dispatch_cache_entry
+ *        against a `const uint8_t*` protocol number needle
+ */
+static int compare_cache_protocol(const void* data, const void* user_data)
+{
+    const struct dmip_dispatch_cache_entry* entry = (const struct dmip_dispatch_cache_entry*)data;
+    uint8_t protocol = *(const uint8_t*)user_data;
+    return (entry->protocol == protocol) ? 0 : -1;
+}
+
+/**
+ * @brief Look up the cached module for `protocol`, if any - see
+ *        dispatch_packet()'s "Protocol dispatch cache" doc comment
+ */
+static Dmod_Context_t* cache_lookup(uint8_t protocol)
+{
+    dmosi_mutex_lock(g_dispatch_cache_mutex);
+    struct dmip_dispatch_cache_entry* entry =
+        (struct dmip_dispatch_cache_entry*)dmlist_find(g_dispatch_cache, &protocol, compare_cache_protocol);
+    Dmod_Context_t* module = (entry != NULL) ? entry->module : NULL;
+    dmosi_mutex_unlock(g_dispatch_cache_mutex);
+    return module;
+}
+
+/**
+ * @brief Record `module` as the cached handler for `protocol`, replacing
+ *        any existing entry - see dispatch_packet()'s "Protocol dispatch
+ *        cache" doc comment
+ *
+ * Failure to allocate a new entry is not reported - the cache is a hint,
+ * not required for correctness, so a failed insert just means the next
+ * dispatch for `protocol` falls back to a full scan again instead of
+ * hitting the cache.
+ */
+static void cache_store(uint8_t protocol, Dmod_Context_t* module)
+{
+    dmosi_mutex_lock(g_dispatch_cache_mutex);
+
+    struct dmip_dispatch_cache_entry* entry =
+        (struct dmip_dispatch_cache_entry*)dmlist_find(g_dispatch_cache, &protocol, compare_cache_protocol);
+    if (entry != NULL)
+    {
+        entry->module = module;
+    }
+    else
+    {
+        entry = Dmod_Malloc(sizeof(*entry));
+        if (entry != NULL)
+        {
+            entry->protocol = protocol;
+            entry->module = module;
+            if (!dmlist_push_back(g_dispatch_cache, entry))
+                Dmod_Free(entry);
+        }
+    }
+
+    dmosi_mutex_unlock(g_dispatch_cache_mutex);
+}
+
+/**
  * @brief Find the handler for `protocol` among every loaded, enabled
  *        dmip_protocol_numbers() implementor, call it with `packet` if
  *        one exists, then free `packet`
@@ -1192,9 +1270,54 @@ dmod_dmip_api_declaration(1.0, void, _for_each_protocol, ( dmip_protocol_visitor
  * prevents that - see dmip_protocol_numbers()'s own doc comment),
  * whichever is discovered first wins; same for more than one fallback
  * claimant.
+ *
+ * ---- Protocol dispatch cache ----
+ *
+ * A full scan costs one dmip_protocol_numbers() call per loaded DIF
+ * implementor - fine for the handful of protocol handlers this tree has
+ * today, but wasteful to repeat for every single packet of an
+ * already-known protocol (the overwhelmingly common case: a given
+ * interface's traffic is mostly the same few protocols over and over).
+ * g_dispatch_cache remembers, per exact protocol number, which module
+ * answered last time - a hint, never authoritative state: every cache hit
+ * is re-verified against that module's own current dmip_protocol_numbers()
+ * before being trusted (module_claims_protocol(), the same check a fresh
+ * scan would make), so a crashed/unloaded/reloaded module - or one that
+ * simply changed its mind about what it claims - is never called on stale
+ * information; it just costs one wasted lookup, falling through to a full
+ * scan exactly as if nothing had been cached. Only exact matches are
+ * cached, never the DMIP_PROTO_DEFAULT fallback: caching that would mean
+ * a newly-loaded module claiming a specific protocol already served by
+ * the cached default claimant could never be discovered again, since
+ * every future packet for that protocol would keep hitting the (still
+ * validly-answering, just no longer exclusively correct) cached default
+ * entry instead of ever re-scanning - unlike an exact-match cache entry
+ * going stale, that failure mode has no self-correcting trigger. A
+ * default-routed or first-seen-protocol packet therefore always pays for
+ * a full scan, same as before this cache existed.
  */
 static void dispatch_packet(uint8_t protocol, dmip_family_t family, dmnetif_iface_t iface, uint8_t* packet, size_t length)
 {
+    Dmod_Context_t* cached = cache_lookup(protocol);
+    if (cached != NULL)
+    {
+        bool ignored_is_default = false;
+        if (module_claims_protocol(cached, protocol, &ignored_is_default))
+        {
+            dmod_dmip_protocol_receive_t handler =
+                (dmod_dmip_protocol_receive_t)Dmod_GetDifFunction(cached, dmod_dmip_protocol_receive_sig);
+            if (handler != NULL)
+            {
+                handler(family, iface, packet, length);
+                Dmod_Free(packet);
+                return;
+            }
+        }
+        /* Stale hint (module gone, or no longer claims `protocol`) - fall
+         * through to a full scan below, which will overwrite or leave
+         * this entry alone depending on what it finds. */
+    }
+
     Dmod_Context_t* default_module = NULL;
     Dmod_Context_t* module = Dmod_GetNextDifModule(dmod_dmip_protocol_numbers_sig, NULL);
 
@@ -1207,6 +1330,7 @@ static void dispatch_packet(uint8_t protocol, dmip_family_t family, dmnetif_ifac
                 (dmod_dmip_protocol_receive_t)Dmod_GetDifFunction(module, dmod_dmip_protocol_receive_sig);
             if (handler != NULL)
                 handler(family, iface, packet, length);
+            cache_store(protocol, module);
             Dmod_Free(packet);
             return;
         }
@@ -1298,13 +1422,15 @@ dmod_dmnetbridge_dif_api_declaration(1.0, dmip, void, _packet_received, ( dmneti
 /* ---- DMOD lifecycle ---- */
 
 /**
- * @brief Module initialization - allocates the reassembly table and its
- *        guarding mutex
+ * @brief Module initialization - allocates the reassembly table, the
+ *        protocol dispatch cache, and their guarding mutexes
  *
- * No protocol dispatch table to allocate anymore - dmip_dispatch_packet()/
- * _for_each_protocol() discover protocol handlers fresh via DIF on every
- * call instead of owning a table modules register into (see dmip.h's
- * "Protocol handler DIF" section).
+ * No protocol dispatch *registration* table to allocate anymore -
+ * dispatch_packet()/_for_each_protocol() discover protocol handlers fresh
+ * via DIF instead of owning a table modules register into (see dmip.h's
+ * "Protocol handler DIF" section). g_dispatch_cache is different: it's a
+ * hint, not authoritative state - see dispatch_packet()'s "Protocol
+ * dispatch cache" doc comment for why that distinction matters.
  */
 int dmod_init(const Dmod_Config_t *Config)
 {
@@ -1322,7 +1448,12 @@ int dmod_init(const Dmod_Config_t *Config)
     g_reassembly = dmlist_create();
     g_reassembly_mutex = dmosi_mutex_create(false);
     g_id_mutex = dmosi_mutex_create(false);
-    if (g_reassembly == NULL || g_reassembly_mutex == NULL || g_id_mutex == NULL)
+    g_dispatch_cache = dmlist_create();
+    g_dispatch_cache_mutex = dmosi_mutex_create(false);
+    if (
+        g_reassembly == NULL || g_reassembly_mutex == NULL || g_id_mutex == NULL
+     || g_dispatch_cache == NULL || g_dispatch_cache_mutex == NULL
+        )
     {
         DMOD_LOG_ERROR("Failed to allocate dmip state\n");
         return -1;
@@ -1336,8 +1467,8 @@ int dmod_init(const Dmod_Config_t *Config)
 }
 
 /**
- * @brief Module deinitialization - frees every in-progress reassembly,
- *        then the reassembly table and its mutex
+ * @brief Module deinitialization - frees every in-progress reassembly and
+ *        every cached dispatch entry, then the tables and mutexes
  */
 int dmod_deinit(void)
 {
@@ -1353,6 +1484,17 @@ int dmod_deinit(void)
     g_reassembly_mutex = NULL;
     dmosi_mutex_destroy(g_id_mutex);
     g_id_mutex = NULL;
+
+    size_t cache_count = dmlist_size(g_dispatch_cache);
+    for (size_t i = 0; i < cache_count; i++)
+    {
+        Dmod_Free(dmlist_pop_front(g_dispatch_cache));
+    }
+    dmlist_destroy(g_dispatch_cache);
+    g_dispatch_cache = NULL;
+
+    dmosi_mutex_destroy(g_dispatch_cache_mutex);
+    g_dispatch_cache_mutex = NULL;
 
     DMOD_LOG_INFO("DMIP deinitialized\n");
     return 0;
