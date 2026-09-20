@@ -107,10 +107,13 @@ int dmod_init(const Dmod_Config_t *Config)
     g_claimed_count = 0;
     g_called = false;
     g_last_packet_len = 0;
+
+    DMOD_LOG_INFO("DMIP_TEST_FIXTURE initialized\n");
     return 0;
 }
 
 int dmod_deinit(void)
 {
+    DMOD_LOG_INFO("DMIP_TEST_FIXTURE deinitialized\n");
     return 0;
 }
